@@ -17,6 +17,8 @@ from config import (
     KNOWLEDGE_DB_FILE,
     KNOWLEDGE_RAW_DIR,
     KNOWLEDGE_TOP_K,
+    OFFTOPIC_STEER_TURNS,
+    PROFILE_DIGEST_MAX_CHARS,
     ROOT,
     TEMPLATE_FILE,
     enterprise_hermes_template_file,
@@ -249,10 +251,10 @@ _EMOTION_GUIDANCE = {
     "neutral": "情绪平稳，正常沟通。",
     "happy": "客户语气积极。可同样温度推进，但不要过度热情显得不专业。",
     "surprised": "客户略带惊讶。先确认是不是听到出乎意料的信息，再继续。",
-    "sad": "客户语气低落。先一句简短共情（如\"我理解您挺难的\"），再放缓节奏，本轮最多 1 个追问。",
-    "fearful": "客户语气紧张/担忧。先一句安抚（如\"别着急，咱们慢慢看\"），把要求材料的语气换成\"方便的时候再准备\"，本轮最多 1 个追问。",
-    "angry": "客户在生气/不满。**先暂停所有追问和材料索取**，用一句话承担和共情（如\"非常抱歉让您等久了\"），然后只回应客户当下最关切的诉求；不要在本轮要求新材料、不要绕开问题、不要照搬模板话术。",
-    "disgusted": "客户在表达反感。处理同 angry——先共情和停止索取，再回应实际诉求。",
+    "sad": "客户语气低落。先一句简短共情（如\"我理解您挺难的\"），再放缓节奏。风控核验类追问仍要进行但措辞放软；可暂缓的是非核验的补料。",
+    "fearful": "客户语气紧张/担忧。先一句安抚（如\"别着急，咱们慢慢看\"）。风控核验类追问照常但措辞改成\"方便时帮我对一下\"式；非核验的材料索取换成\"方便的时候再准备\"。",
+    "angry": "客户在生气/不满。先用一句话承担和共情（如\"非常抱歉让您着急了\"），优先回应客户当下最关切的诉求。**风控核验类追问不因情绪豁免**——仍要在共情之后用软措辞问；可暂缓的只是非核验的新材料索取，不要在本轮火上浇油，不要照搬模板话术。",
+    "disgusted": "客户在表达反感。处理同 angry——先共情、暂缓非核验补料，但风控核验追问仍要进行，再回应实际诉求。",
 }
 
 
@@ -319,6 +321,86 @@ def _wallet_pending_block(enterprise_id: str) -> str:
     return "\n".join(lines)
 
 
+_LOAN_KEYWORDS = (
+    "额度", "利率", "贷", "还款", "流水", "纳税", "营业额", "营收", "收入", "支出",
+    "成本", "利润", "用途", "周转", "抵押", "担保", "合同", "订单", "采购", "进货",
+    "回款", "应收", "社保", "工资", "发票", "开票", "放款", "授信", "征信", "负债",
+    "资金", "经营", "材料", "证件", "执照", "对公", "账户", "月供", "分期", "审批",
+)
+
+
+def loan_relevant(text: str) -> bool:
+    """客户消息是否还贴着贷款主题（命中任一业务关键词即算）。"""
+    body = str(text or "")
+    return any(keyword in body for keyword in _LOAN_KEYWORDS)
+
+
+def conversation_drift_turns(messages: list[dict[str, Any]]) -> int:
+    """从末尾回溯，统计连续"小微自己没做贷款工作"的轮数。
+
+    以**小微（assistant）的回复**是否触及贷款业务为准，而不是看客户消息——
+    客户在闲聊里夹一个"额度/账户"就刷掉计数，是个会被钻空子的信号；真正要
+    度量的是"小微连续多少轮只在共情/闲聊、没推进贷款"。命中任一业务关键词
+    的 assistant 回复即视为"做了贷款工作"，计数清零。
+    """
+    count = 0
+    for message in reversed(messages):
+        if message.get("role") != "assistant":
+            continue
+        if loan_relevant(message.get("content", "")):
+            break
+        count += 1
+    return count
+
+
+def profile_digest_for_prompt(
+    enterprise_id: str, *, max_chars: int = PROFILE_DIGEST_MAX_CHARS
+) -> str:
+    """把已生成的风控画像注入聊天 prompt，作为跨轮的长期记忆。
+
+    画像每 10 轮自动更新，沉淀了早期的规模/流水/用途/纳税与待核验点；
+    近期对话窗口只剩最近几轮，更早的事实靠这份画像兜底。
+    """
+    if not enterprise_id:
+        return "（暂无企业画像，可依据本轮对话判断。）"
+    try:
+        _path, markdown = load_profile_markdown(enterprise_id)
+    except Exception:
+        return "（暂无企业画像，可依据本轮对话判断。）"
+    if not is_profile_document(markdown):
+        return "（画像尚未生成——对话还不足以自动建档，请依据本轮对话和已知事实判断。）"
+    text = markdown.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n…（画像较长，已截断）"
+
+
+def wallet_facts_block(enterprise_id: str) -> str:
+    """实时流水汇总，作为"额度/收支是否匹配"验算的真实锚点。"""
+    if not enterprise_id:
+        return "（暂无流水数据。）"
+    try:
+        summary = wallet_summary(load_wallet_transactions(enterprise_id))
+    except Exception:
+        return "（暂无流水数据。）"
+    if not summary.get("transaction_count"):
+        return "本企业暂未录入任何流水（收入/支出）记录，验算时只能依据客户口述，需提醒补流水。"
+    plan = summary.get("plan", {}) if isinstance(summary, dict) else {}
+    lines = [
+        f"流水笔数：{summary.get('transaction_count', 0)}",
+        f"收入合计：¥{summary.get('income', 0)}",
+        f"支出合计：¥{summary.get('expense', 0)}",
+        f"净额：¥{summary.get('net', 0)}",
+    ]
+    avg_income = plan.get("avg_monthly_income")
+    if avg_income:
+        lines.append(f"月均收入：¥{avg_income}")
+    avg_expense = plan.get("avg_monthly_expense")
+    if avg_expense:
+        lines.append(f"月均支出：¥{avg_expense}")
+    return "\n".join(lines)
+
+
 def build_gateway_chat_turn(
     messages: list[dict[str, str]],
     user_message: str,
@@ -334,13 +416,31 @@ def build_gateway_chat_turn(
     image_context = format_image_hits_for_prompt(image_hits or [])
     audio_signals_block = _audio_signals_block(attachments or [])
     enterprise_name = str((enterprise or {}).get("name") or "当前企业")
-    wallet_pending_block = _wallet_pending_block(str((enterprise or {}).get("id") or ""))
+    enterprise_id = str((enterprise or {}).get("id") or "")
+    wallet_pending_block = _wallet_pending_block(enterprise_id)
+    profile_digest = profile_digest_for_prompt(enterprise_id)
+    wallet_facts = wallet_facts_block(enterprise_id)
+
+    # 回归主航道：以"小微自己连续几轮没做贷款工作"为准（客户夹个关键词刷不掉）。
+    drift = conversation_drift_turns(messages)
+    if drift >= OFFTOPIC_STEER_TURNS:
+        steer_note = (
+            f"**本轮提示**：你已经连续约 {drift} 轮只在共情/闲聊、没有推进贷款。"
+            "请先自然回应客户当前话题（别冷场），再用一句话把对话温和带回贷款进度、"
+            "还缺的材料或仍未核实清楚的疑点；不要生硬打断。"
+            "若客户正在明确告别 / 暂停，则不拉回（遵循规则 11）。"
+        )
+    else:
+        steer_note = "（小微近几轮仍在推进贷款业务，无需特别引导。）"
+
     return f"""你的名字叫"小微"，正在通过网页 UI 作为小微贷款客户经理服务当前企业。
 
 请以"小微"的身份面向客户自然回复，被问到身份时介绍自己叫小微。要求：
 1. 先承接客户当前问题，再追问 1 到 3 个最关键的信息。
 2. 不要输出完整风控画像表格，画像由单独按钮更新。
 3. 如果发现字段变化、用途混杂、隐性负债、回款慢等风险，只在对话中温和确认，不要停止对话。
+3.1 **静默交叉验算（内部动作，每轮必做，不外显、情绪不豁免）**：把客户已陈述或下方"风控画像/经营流水事实"中已记录的数字做一次心算核对——①收入−成本≈自报利润？②人员/产能配比是否合理（如护工数 vs 服务人数、员工规模 vs 营收）？③申请额度是否匹配月流水、纳税、开票规模？④设备型号 / 供应商 / 对手方是否常见、可核？做"额度/收支是否匹配"判断时，**以"经营流水事实"里的系统汇总数字为准，不要只信口述**。发现矛盾时**绝不**说"欺诈/不合理/对不上账"，改用"帮我对一下口径"式温和追问（如"您前面提到 X 和 Y，我这边核一下，方便说下……吗？"），并把疑点记为待核验点。**这类风控核验追问在任何情绪下都要进行**，情绪只决定措辞软硬和是否先共情（见规则 8.2）。
+3.2 **核验要闭环、跨轮咬住**：客户用"让财务对一下/回头补/差不多就那样/具体没定/挺多的"这类**含糊或推托**回应，**不算把疑点核实清楚**，不要因此放过。处理方式——①一句话礼貌确认并明确记成待核验（如"行，那这条我先记成待核实"）；②若有材料能闭合，追加 `upload_request` 请客户补（如设备采购合同、医保结算单、对公流水）；③**后续轮次换个说法继续追**，直到客户给出可核验的答复或材料，别让它不了了之。下方"风控画像"的"待核验"里若仍有未闭合项、且客户本轮没正面回应，本轮要自然地把其中最关键的一条再追一次。客户主动抛新话题/打感情牌时，可以先接一句，但不要让它变成永久绕开核验的借口。
 4. 使用中文，回复简洁专业；语气亲切自然，鼓励适度使用友好表情让对话更有温度，具体用哪个表情、什么时候用都由你自己贴合语境判断——通常每条回复用 1 个左右，自然顺手即可，不要堆砌、不要每句都加。
 5. 不要输出隐藏思维链、工具过程、分析标题或 XML thinking 标签；只输出小微会对客户说的话。
 6. 优先参考“本地知识库片段”中的产品、材料、流程、风控口径；没有依据时不要编造确定结论。
@@ -348,8 +448,8 @@ def build_gateway_chat_turn(
 8. 如果知识库片段包含欺诈案例，只能用于内部识别相似风险、调整追问策略和记录待核验点；不得对客户说“欺诈”“骗贷”“案例相似”等定性话。
 8.1 "客户历史图档命中"里的图片是**本企业客户自己在过去对话里上传过的材料**（流水、合同、截图等）。每轮根据本次客户输入（文字或图片）自动调出最相似的历史档。用途是发现**前后矛盾**：金额/对手方/日期/抬头与历史是否一致。命中时要用具体差异来追问（"您上次给的这张流水里 X 月入账是 Y，这张是 Z，能帮我对一下吗？"），不要泄露内部"知识库""相似度""文件名"等概念；为空时不要凭空提及历史比对。
 8.2 "本轮客户语音信号" 是 qwen3-asr-flash 对客户当前语音情绪/语种的判断。情绪标签会改变你的语气和节奏：
-   - **angry / disgusted**：先共情和承担（一句话），然后**只回应客户当下诉求**，本轮不再要求新材料、不发 upload_request、不重复之前的追问。
-   - **sad / fearful**：先一句简短安抚，节奏放慢，本轮最多 1 个追问，措辞改成"方便时再说"。
+   - **angry / disgusted**：先共情和承担（一句话），优先回应客户当下诉求。**风控核验类追问（规则 3.1）不因情绪豁免**——仍要在共情之后用尽量软的措辞问；可暂缓的只是非核验的新材料索取 / upload_request，本轮不要在这上面火上浇油。
+   - **sad / fearful**：先一句简短安抚，节奏放慢。风控核验类追问照常进行但措辞放软；非核验的材料索取改成"方便时再说"。
    - **happy / surprised / neutral**：按正常节奏走。
    - **绝对不要**把"我听出您很生气/难过/紧张"这类话原样说给客户——这是冒犯。情绪标签只影响**你怎么说**，不要变成**你说什么**。
    - 如果"语言=en"，客户用英文说的，你可以**用中文承接 + 复述一句英文关键句**确保理解一致，但回复仍以中文为主（除非客户明确要求英文）。
@@ -389,6 +489,15 @@ def build_gateway_chat_turn(
 
 当前登录企业：
 {enterprise_name}
+
+风控画像（每 10 轮自动更新、可能滞后几轮；沉淀了此前累积的经营事实与待核验点，作为长期记忆——下方"已有网页对话"只剩最近几轮，更早的事实以这份画像为准）：
+{profile_digest}
+
+经营流水事实（系统实时汇总，做规则 3.1 里"额度/收支是否匹配"验算时以这里的数字为准，不要只信口述）：
+{wallet_facts}
+
+回归主航道（每轮重新判断）：
+{steer_note}
 
 钱包提案状态（每轮重新计算，以此为准，不要相信对话历史里的"我刚提议过"）：
 {wallet_pending_block}

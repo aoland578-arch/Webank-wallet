@@ -45,6 +45,11 @@ AUTO_PROFILE_INTERVAL = 10
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 GATEWAY_IDLE_TIMEOUT_SECONDS = int(os.environ.get("WEWALLET_GATEWAY_IDLE_S", str(30 * 60)))
 GATEWAY_SWEEP_INTERVAL_SECONDS = int(os.environ.get("WEWALLET_GATEWAY_SWEEP_S", str(5 * 60)))
+# 小微自己连续多少轮没做贷款工作（只共情/闲聊）后，提示她温和拉回主航道。
+# 度量的是 assistant 的回复而非客户消息，所以阈值比"看客户关键词"时低。
+OFFTOPIC_STEER_TURNS = int(os.environ.get("WEWALLET_OFFTOPIC_STEER_TURNS", "4"))
+# 注入聊天 prompt 的风控画像最大字数（防止 prompt 过长）。
+PROFILE_DIGEST_MAX_CHARS = int(os.environ.get("WEWALLET_PROFILE_DIGEST_MAX_CHARS", "3000"))
 
 
 class AuthError(Exception):
