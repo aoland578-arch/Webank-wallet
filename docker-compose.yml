@@ -15,6 +15,12 @@ services:
       HERMES_AGENT_DIR: /opt/hermes-agent
       WEWALLET_COOKIE_SECURE: "${WEWALLET_COOKIE_SECURE:-0}"
       WEWALLET_SMS_DEBUG: "0"
+      # 端到端实时语音：中继须监听 0.0.0.0，nginx 容器才能经 app:8789 连到；
+      # 前端走同源路径 /voicecall-relay（nginx 反代），https 页面自动升级为 wss。
+      # 还需在 .env 里放 STEP_API_KEY 并设 WEWALLET_VOICECALL_PROVIDER=stepfun。
+      WEWALLET_VOICECALL_VOICE_BACKEND: "realtime"
+      WEWALLET_VOICECALL_RELAY_HOST: "0.0.0.0"
+      WEWALLET_VOICECALL_RELAY_PATH: "/voicecall-relay"
     volumes:
       - ./runtime/app_data:/data/app_data
       - ./runtime/ui_data:/data/ui_data
@@ -34,5 +40,7 @@ services:
         condition: service_healthy
     ports:
       - "80:80"
+      - "443:443"   # HTTPS：放证书 + 取消 wewallet.conf 里 443 段注释后生效
     volumes:
       - ./deploy/nginx/wewallet.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro   # fullchain.pem + privkey.pem

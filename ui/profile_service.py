@@ -247,6 +247,63 @@ def parse_suggestions(content: str, *, limit: int = 3) -> list[str]:
     return cleaned
 
 
+# 规则化快捷追问语料：(触发关键词, 候选追问)。命中小微上一条回复或客户消息里的
+# 关键词就推对应的追问气泡，纯本地匹配、零模型调用——取代原来每轮再跑一次大模型。
+_SUGGESTION_RULES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("额度", "能批", "批多少", "授信", "上限"), ("大概能批多少额度？", "额度是怎么算的？", "怎么才能多批点？")),
+    (("利率", "利息", "年化", "费率", "多少个点"), ("利息具体怎么算？", "有没有更低的利率？", "利息还能优惠吗？")),
+    (("还款", "月供", "分期", "期限", "还多久", "按月", "提前还"), ("每个月还多少？", "最长能借多久？", "能提前还款吗？")),
+    (("流水", "对公", "入账", "银行卡", "账户"), ("流水不够怎么办？", "流水怎么发给你？", "要几个月的流水？")),
+    (("材料", "资料", "证件", "执照", "合同", "报价", "凭证", "上传", "补充", "清单"), ("需要准备哪些材料？", "材料怎么交给你？", "材料齐了多久能批？")),
+    (("纳税", "完税", "开票", "社保", "工资"), ("没怎么纳税有影响吗？", "完税证明在哪开？")),
+    (("用途", "周转", "进货", "采购", "装修", "设备", "扩建"), ("贷款用途有限制吗？", "钱能用来周转吗？")),
+    (("申请", "办理", "流程", "怎么弄", "怎么办", "下一步", "接下来"), ("接下来我要做什么？", "现在就能申请吗？", "多久能放款？")),
+    (("放款", "到账", "多久能下来", "几天"), ("批下来多久到账？", "放款快不快？")),
+    (("抵押", "担保", "征信", "负债", "欠款", "借过"), ("没有抵押能贷吗？", "征信有点问题行吗？")),
+)
+
+_SUGGESTION_FALLBACK = (
+    "大概能批多少额度？", "利息怎么算？", "需要准备哪些材料？", "接下来我要做什么？", "最长能借多久？",
+)
+
+
+def rule_based_suggestions(
+    messages: list[dict[str, Any]] | None,
+    user_message: str,
+    assistant_content: str,
+    enterprise: dict[str, Any] | None = None,
+    *,
+    limit: int = 3,
+) -> list[str]:
+    """本地规则生成快捷追问气泡，零模型调用。
+
+    匹配小微刚回复 + 客户最新输入里的关键词，推相关追问；去掉客户最近几轮已经
+    问过的，凑不满再用兜底池补齐。
+    """
+    haystack = f"{assistant_content}\n{user_message}"
+    recent = " ".join(str(m.get("content") or "") for m in (messages or [])[-6:])
+    picks: list[str] = []
+    seen: set[str] = set()
+
+    def add(chip: str) -> None:
+        text = chip.strip()
+        if text and text not in seen and text[:6] not in recent:
+            seen.add(text)
+            picks.append(text)
+
+    for keywords, chips in _SUGGESTION_RULES:
+        if any(k in haystack for k in keywords):
+            for chip in chips:
+                add(chip)
+                if len(picks) >= limit:
+                    return picks[:limit]
+    for chip in _SUGGESTION_FALLBACK:
+        add(chip)
+        if len(picks) >= limit:
+            break
+    return picks[:limit]
+
+
 _EMOTION_GUIDANCE = {
     "neutral": "情绪平稳，正常沟通。",
     "happy": "客户语气积极。可同样温度推进，但不要过度热情显得不专业。",
@@ -353,13 +410,59 @@ def conversation_drift_turns(messages: list[dict[str, Any]]) -> int:
     return count
 
 
+# 注入聊天 prompt 时只保留对"承接对话 + 交叉验算 + 咬住待核验"最有用的章节，
+# 丢掉只增不减的日志节（字段变更审计、追问记录），既减 token 又更聚焦。
+_DIGEST_SECTION_KEYWORDS = ("风控结论", "结论", "经营", "财务", "事实", "风险", "信号", "待核验", "核验", "疑点")
+
+
+def _select_profile_sections(markdown: str) -> str:
+    """抽取风控相关的二级章节（## ...），拼接返回；没有命中则返回空串。"""
+    lines = markdown.splitlines()
+    preamble: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    head: str | None = None
+    body: list[str] = []
+
+    def flush() -> None:
+        nonlocal head, body
+        if head is not None:
+            blocks.append((head, body))
+        body = []
+
+    for line in lines:
+        if re.match(r"^##\s+", line):
+            flush()
+            head = line
+            body = [line]
+        elif head is None:
+            preamble.append(line)
+        else:
+            body.append(line)
+    flush()
+
+    kept = [
+        "\n".join(b).strip()
+        for h, b in blocks
+        if any(keyword in h for keyword in _DIGEST_SECTION_KEYWORDS)
+    ]
+    if not kept:
+        return ""
+    parts = []
+    pre = "\n".join(preamble).strip()
+    if pre:
+        parts.append(pre)
+    parts.extend(kept)
+    return "\n\n".join(parts).strip()
+
+
 def profile_digest_for_prompt(
     enterprise_id: str, *, max_chars: int = PROFILE_DIGEST_MAX_CHARS
 ) -> str:
     """把已生成的风控画像注入聊天 prompt，作为跨轮的长期记忆。
 
-    画像每 10 轮自动更新，沉淀了早期的规模/流水/用途/纳税与待核验点；
-    近期对话窗口只剩最近几轮，更早的事实靠这份画像兜底。
+    画像自动更新（默认每 20 轮），沉淀了早期的规模/流水/用途/纳税与待核验点；
+    近期对话窗口只剩最近几轮，更早的事实靠这份画像兜底。只注入风控相关章节
+    （结论/经营财务事实/风险信号/待核验），丢掉审计与追问日志以省 token。
     """
     if not enterprise_id:
         return "（暂无企业画像，可依据本轮对话判断。）"
@@ -369,7 +472,7 @@ def profile_digest_for_prompt(
         return "（暂无企业画像，可依据本轮对话判断。）"
     if not is_profile_document(markdown):
         return "（画像尚未生成——对话还不足以自动建档，请依据本轮对话和已知事实判断。）"
-    text = markdown.strip()
+    text = _select_profile_sections(markdown) or markdown.strip()
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n…（画像较长，已截断）"
@@ -422,13 +525,13 @@ def build_gateway_chat_turn(
     wallet_facts = wallet_facts_block(enterprise_id)
 
     # 回归主航道：以"小微自己连续几轮没做贷款工作"为准（客户夹个关键词刷不掉）。
+    # 不判断客户是否告别——只在客户给到自然开口时把没闭合的疑点带回，纯寒暄/道别则不硬塞。
     drift = conversation_drift_turns(messages)
     if drift >= OFFTOPIC_STEER_TURNS:
         steer_note = (
-            f"**本轮提示**：你已经连续约 {drift} 轮只在共情/闲聊、没有推进贷款。"
-            "请先自然回应客户当前话题（别冷场），再用一句话把对话温和带回贷款进度、"
-            "还缺的材料或仍未核实清楚的疑点；不要生硬打断。"
-            "若客户正在明确告别 / 暂停，则不拉回（遵循规则 11）。"
+            f"**本轮提示**：你已连续约 {drift} 轮只在共情/闲聊。"
+            "下方'待核验'里若还有没闭合的项，**等客户这轮给到自然开口时**再用一句话温和带回，"
+            "别生硬打断；若本轮客户只是纯寒暄/道别、没有开口，就温暖回应一句，不要硬塞业务。"
         )
     else:
         steer_note = "（小微近几轮仍在推进贷款业务，无需特别引导。）"
@@ -476,7 +579,7 @@ def build_gateway_chat_turn(
    - items 至少 1 项，最多 4 项；name 简短（≤12 字）。
    - JSON 必须能被解析；除该 fenced 块外不要再输出其它代码块。
    - 不要在正文里复述"请上传…"列表，卡片会替你说；正文里点到为止。
-11. **以客户最新消息为准**：客户暂停或告别时，由你结合语境自然判断如何回应，不要机械追加收尾话术，也不要继续强推流程。告别不是永久状态；如果客户之后继续提出实质问题，正常回答当前问题并继续服务。
+11. **始终营业 / 待命，按本轮实际内容成比例回应（不要判断客户是否要走）**：每一轮只针对客户这条消息里真实存在的内容作出反应——有问题就正面答清楚（风控问题按规则 3.1 核口径，不能用一个表情或一句"晚安"代替回答），有新信息就接住，有可推进的开口就顺势推进或索取材料。若这一轮没有任何可作答 / 可推进的实质内容（纯寒暄、絮叨、道别），就简短温暖地回应一句即可，**不要凭空制造话术、不要催促、也不要机械追加收尾话术**。你不需要也不要去判断客户"是不是要走"——只看这一轮有没有值得回应 / 推进的东西；客户随时回到实质问题就正常服务。
 
 本地知识库片段：
 {knowledge_context}
@@ -531,6 +634,7 @@ def build_profile_prompt(messages: list[dict[str, str]], enterprise_id: str, ent
 4. 风险信号要写明事实依据、初步判断、待核验/追问动作。
 5. 如果信息缺失，保留空项或写“待补充”。
 6. 禁止输出思考过程、推理过程、分析过程、内部提示或标签。
+7. **控制档案体积**：未获得新信息的章节原样保留、不要重写扩写；"字段变更审计""追问记录"这类按时间累加的日志，**只保留最近 8 条**，更早的可省略或合并成一句概述，避免档案无限膨胀拖慢生成。
 {template_block}
 
 现有档案：
@@ -559,7 +663,8 @@ def run_profile_update(
     session_name = f"profile:{enterprise_id}:{time.time_ns()}"
     try:
         profile_path, old_markdown = load_profile_markdown(enterprise_id)
-        gateway = gateway_for_enterprise(enterprise_id)
+        # 独立网关：画像更新（耗时长）不与交互聊天抢同一个子进程。
+        gateway = gateway_for_enterprise(enterprise_id, slot="profile")
         result = gateway.submit(
             session_name,
             build_profile_prompt(messages, enterprise_id, enterprise),
@@ -600,7 +705,7 @@ def run_profile_update(
             "trigger": trigger,
         }
     finally:
-        gateway_for_enterprise(enterprise_id).reset_session(session_name)
+        gateway_for_enterprise(enterprise_id, slot="profile").reset_session(session_name)
         lock.release()
 
 

@@ -86,6 +86,37 @@ http://服务器公网 IP/chat
 https://你的域名/chat
 ```
 
+## 5.5 端到端实时语音（通话版小微）+ HTTPS
+
+视频通话的"实时语音"用 StepFun `stepaudio-2.5-realtime`，是 WebSocket 端到端语音，
+浏览器调摄像头/麦克风、连 wss **都要求 HTTPS（安全上下文）**，所以必须先配证书。
+
+**a) 环境变量**（`.env`）：
+```bash
+STEP_API_KEY=你的阶跃key            # platform.stepfun.com 申请；勿提交
+WEWALLET_VOICECALL_PROVIDER=stepfun  # 看材料的视觉识别用 step-3.7-flash
+WEWALLET_COOKIE_SECURE=1             # 上 HTTPS 后开启
+```
+其余 realtime 开关（后端=realtime、中继监听 0.0.0.0、同源路径 /voicecall-relay）
+已写进 `docker-compose.yml`，无需手动设。中继访问令牌默认每次启动随机生成。
+
+**b) 镜像依赖**：`deploy/hermes-agent-requirements.txt` 已含 `websockets`，
+`docker compose up -d --build` 重新构建即装上（中继靠它，缺了实时语音不可用）。
+
+**c) Nginx WebSocket 反代**：`deploy/nginx/wewallet.conf` 已加 `location /voicecall-relay`
+反代到 `app:8789`（含 `map $http_upgrade` 与长超时）。
+
+**d) HTTPS 证书**（以腾讯云免费证书为例）：
+1. 控制台 → SSL 证书 → 申请免费证书（域名 `www.wewalletpro.online`）→ 验证 → 签发。
+2. 下载 **Nginx** 格式，得到 `*_bundle.crt` 和 `*.key`。
+3. 传到服务器，放进 `deploy/certs/`，改名为 `fullchain.pem` 和 `privkey.pem`。
+4. 打开 `deploy/nginx/wewallet.conf`，**取消文件末尾 443 server 段的整段注释**。
+5. `docker compose up -d`（compose 已映射 443 端口、挂载 `deploy/certs`）。
+6. 云安全组放行 **443**。
+
+完成后手机/电脑访问 `https://www.wewalletpro.online/chat`，登录进视频通话即可实时对话；
+"给小微看材料"会截一帧给 step-3.7-flash 识别后让小微当场转述。
+
 ## 6. 备份
 
 手动备份：

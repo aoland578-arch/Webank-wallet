@@ -124,6 +124,10 @@
           </span>
         </button>
       </div>
+
+      <footer class="icp-beian icp-beian--sidebar">
+        <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer noopener">桂ICP备2026011057号-1</a>
+      </footer>
     </aside>
 
     <main class="chat-stage">
@@ -156,6 +160,9 @@
             <button class="prompt-chip" type="button">想看看适合的贷款方案</button>
             <button class="prompt-chip" type="button">开厂买设备需要一笔钱</button>
           </div>
+          <footer class="icp-beian icp-beian--home">
+            <a href="https://beian.miit.gov.cn/" target="_blank" rel="noreferrer noopener">桂ICP备2026011057号-1</a>
+          </footer>
         </div>
       </section>
 
@@ -303,37 +310,66 @@
       <p id="loanMessage" class="account-profile-message"></p>
     </section>
 
-    <div id="videoCallBackdrop" class="modal-backdrop" hidden></div>
+    <div id="videoCallBackdrop" class="modal-backdrop video-call-backdrop" hidden></div>
     <section id="videoCallModal" class="video-call-modal" aria-hidden="true" hidden>
-      <div class="audit-header">
-        <div>
-          <h2>视频通话</h2>
-          <p id="videoCallStatus">与小微建立视频连线（演示版，信令暂未接入）。</p>
-        </div>
-        <button id="closeVideoCallButton" class="icon-button" type="button" aria-label="关闭视频通话">×</button>
+      <!-- 自拍画面铺满整屏作背景（小微无画面，靠语音 + 顶部身份呈现） -->
+      <video id="videoCallSelf" class="video-call-video" autoplay muted playsinline></video>
+      <div id="videoCallSelfPlaceholder" class="video-call-self-placeholder">
+        <span class="video-call-self-avatar" aria-hidden="true">我</span>
+        <span class="video-call-hint">正在开启摄像头…</span>
       </div>
-      <div class="video-call-stage">
-        <div class="video-call-pane video-call-pane-remote">
-          <div class="video-call-placeholder">
-            <span class="video-call-avatar" aria-hidden="true">微</span>
-            <span class="video-call-label">小微</span>
-            <span class="video-call-hint">等待接入...</span>
+      <div class="video-call-scrim" aria-hidden="true"></div>
+
+      <!-- 顶部：小微身份 + 状态 + 关闭 -->
+      <header class="video-call-topbar">
+        <div class="video-call-peer">
+          <span class="video-call-peer-avatar" aria-hidden="true">微</span>
+          <div class="video-call-peer-meta">
+            <span class="video-call-peer-name">小微</span>
+            <span id="videoCallStatus" class="video-call-peer-status">正在接通…</span>
           </div>
         </div>
-        <div class="video-call-pane video-call-pane-self">
-          <video id="videoCallSelf" class="video-call-video" autoplay muted playsinline></video>
-          <div id="videoCallSelfPlaceholder" class="video-call-placeholder">
-            <span class="video-call-avatar" aria-hidden="true">我</span>
-            <span class="video-call-label">我</span>
-            <span class="video-call-hint">点击下方"开启摄像头"</span>
-          </div>
+        <button id="closeVideoCallButton" class="video-call-close" type="button" aria-label="关闭视频通话">×</button>
+      </header>
+
+      <!-- 中部：聆听指示 + 字幕 -->
+      <div class="video-call-center">
+        <div id="videoCallListening" class="video-call-listening" aria-hidden="true"><span></span><span></span><span></span></div>
+        <p id="videoCallCaption" class="video-call-caption" hidden></p>
+      </div>
+
+      <!-- 底部圆形控制栏 -->
+      <footer class="video-call-dock">
+        <div class="video-call-controls">
+          <button id="videoCallMuteButton" class="vc-btn" type="button" aria-label="静音">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/></svg>
+            </span>
+            <span class="vc-btn-label">静音</span>
+          </button>
+          <button id="videoCallShowDocButton" class="vc-btn" type="button" aria-label="给小微看材料" disabled>
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><line x1="8" y1="8" x2="16" y2="8"/><line x1="8" y1="12" x2="16" y2="12"/><line x1="8" y1="16" x2="13" y2="16"/></svg>
+            </span>
+            <span class="vc-btn-label">看材料</span>
+          </button>
+          <button id="videoCallStartButton" class="vc-btn vc-btn-camera" type="button" aria-label="摄像头开关">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 8.5V7a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2v-1.5l5 3.5V5l-5 3.5z"/></svg>
+            </span>
+          </button>
+          <button id="videoCallEndButton" class="vc-btn vc-btn-danger" type="button" aria-label="挂断">
+            <span class="vc-ico" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15.5a14 14 0 0 1-4.2-.7 1.3 1.3 0 0 0-1.3.3l-1.8 1.8a15 15 0 0 1-6.6-6.6l1.8-1.8a1.3 1.3 0 0 0 .3-1.3A14 14 0 0 1 8.5 3 1.3 1.3 0 0 0 7.2 1.7H4.3A1.3 1.3 0 0 0 3 3.2 18 18 0 0 0 20.8 21a1.3 1.3 0 0 0 1.5-1.3v-2.9a1.3 1.3 0 0 0-1.3-1.3z" transform="rotate(135 12 12)"/></svg>
+            </span>
+            <span class="vc-btn-label">挂断</span>
+          </button>
         </div>
-      </div>
-      <div class="video-call-controls">
-        <button id="videoCallStartButton" class="primary-button" type="button">开启摄像头</button>
-        <button id="videoCallMuteButton" class="secondary-button" type="button" disabled>静音</button>
-        <button id="videoCallEndButton" class="secondary-button danger" type="button" disabled>挂断</button>
-      </div>
+        <p class="video-call-disclaimer">内容由 AI 生成</p>
+      </footer>
+
+      <!-- 旧版"和小微对话"按钮：现由打开即自动接通，隐藏保留供脚本兼容/回落 -->
+      <button id="videoCallTalkButton" type="button" hidden>和小微对话</button>
     </section>
 
     <div id="accountBackdrop" class="modal-backdrop" hidden></div>
@@ -492,5 +528,6 @@
   </template>
 
   <script src="/static/chat.js"></script>
+  <script src="/static/voicecall.js"></script>
 </body>
 </html>

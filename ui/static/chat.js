@@ -1578,25 +1578,16 @@ function openVideoCall() {
   videoCallModal.hidden = false;
   videoCallModal.setAttribute("aria-hidden", "false");
   showVideoCallSelfPlaceholder(!videoCallState.stream);
-  if (!videoCallState.stream) {
-    setVideoCallStatus("演示版：尚未接入信令，可先开启本地摄像头预览。");
-  }
+  setVideoCallStatus("正在接通…");
 }
 
 function stopVideoCallStream() {
+  // 通话的媒体流/按钮状态现由 voicecall.js 统管，这里只清理 chat.js 自己开过的预览流。
   if (videoCallState.stream) {
     videoCallState.stream.getTracks().forEach((track) => track.stop());
     videoCallState.stream = null;
   }
-  if (videoCallSelf) videoCallSelf.srcObject = null;
   videoCallState.muted = false;
-  if (videoCallMuteButton) {
-    videoCallMuteButton.disabled = true;
-    videoCallMuteButton.textContent = "静音";
-  }
-  if (videoCallEndButton) videoCallEndButton.disabled = true;
-  if (videoCallStartButton) videoCallStartButton.disabled = false;
-  showVideoCallSelfPlaceholder(true);
 }
 
 function closeVideoCall() {
@@ -2445,9 +2436,7 @@ openLoanButton.onclick = openLoan;
 closeLoanButton.onclick = closeLoan;
 loanBackdrop.onclick = closeLoan;
 refreshLoanButton.onclick = recomputeLoanEstimate;
-openVideoCallButton.addEventListener("click", () => {
-  showComingSoon("视频通话");
-});
+openVideoCallButton.addEventListener("click", openVideoCall);
 closeVideoCallButton.onclick = closeVideoCall;
 videoCallBackdrop.onclick = closeVideoCall;
 videoCallStartButton.onclick = startVideoCallPreview;

@@ -409,13 +409,21 @@ class HermesTuiGateway:
                 pass
 
 
-def gateway_for_enterprise(enterprise_id: str) -> HermesTuiGateway:
+def gateway_for_enterprise(enterprise_id: str, slot: str = "") -> HermesTuiGateway:
+    """Return the gateway for an enterprise.
+
+    ``slot`` lets heavy background work (e.g. profile updates) run on a
+    separate gateway subprocess so it doesn't serialize behind / contend with
+    the interactive chat gateway. Same enterprise + different slot = a distinct
+    long-lived process keyed as ``"{id}#{slot}"``.
+    """
     home = ensure_enterprise_hermes_home(enterprise_id)
+    key = enterprise_id if not slot else f"{enterprise_id}#{slot}"
     with GATEWAY_LOCK:
-        gateway = GATEWAYS.get(enterprise_id)
+        gateway = GATEWAYS.get(key)
         if gateway is None:
             gateway = HermesTuiGateway(home, enterprise_id=enterprise_id)
-            GATEWAYS[enterprise_id] = gateway
+            GATEWAYS[key] = gateway
         return gateway
 
 

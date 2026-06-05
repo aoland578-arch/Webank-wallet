@@ -891,7 +891,7 @@ button {
   height: 100dvh;
   overflow: hidden;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto auto;
   gap: 16px;
   padding: 16px 12px 12px;
   background: var(--sidebar);
@@ -1165,6 +1165,38 @@ button {
   position: relative;
   padding-top: 8px;
   border-top: 1px solid rgba(22, 61, 76, 0.09);
+}
+
+/* ICP 备案号底部链接（手机 / 网站 UI 均显示） */
+.icp-beian {
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.icp-beian a {
+  color: var(--sidebar-muted);
+  text-decoration: none;
+  opacity: 0.85;
+  transition: opacity 120ms ease;
+}
+
+.icp-beian a:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+/* 桌面：备案号挂在侧栏底部；首页那份只在手机显示，避免桌面重复 */
+.icp-beian--home {
+  display: none;
+  margin-top: 18px;
+  color: var(--muted);
+}
+
+@media (max-width: 980px) {
+  .icp-beian--home {
+    display: block;
+  }
 }
 
 .account-avatar {
@@ -3523,30 +3555,20 @@ button {
   color: #fff;
 }
 
+/* ── 通话界面：微信风格全屏语音/视频通话 ─────────────────────────── */
+.video-call-backdrop { background: rgba(8, 14, 20, 0.55); }
+
 .video-call-modal {
-  width: min(820px, calc(100vw - 32px));
-  max-height: calc(100vh - 48px);
-  max-height: calc(100dvh - 48px);
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
-  gap: 16px;
+  /* 桌面端：居中一块"手机"面板；移动端在断点处铺满全屏 */
+  width: min(420px, calc(100vw - 24px));
+  height: min(860px, calc(100dvh - 24px));
+  padding: 0;
+  border: 0;
+  border-radius: 26px;
   overflow: hidden;
-}
-
-.video-call-stage {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 12px;
-  min-height: 320px;
-}
-
-.video-call-pane {
-  position: relative;
-  aspect-ratio: 4 / 3;
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 14px;
-  background: #182531;
+  background: #0d1620;
+  box-shadow: 0 30px 90px rgba(4, 12, 20, 0.5);
+  color: #fff;
 }
 
 .video-call-video {
@@ -3555,57 +3577,226 @@ button {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  background: #000;
+  background: #0d1620;
+  transform: scaleX(-1); /* 自拍镜像，像照镜子更自然 */
 }
 
-.video-call-placeholder {
+.video-call-self-placeholder {
   position: absolute;
   inset: 0;
   display: grid;
   align-content: center;
   justify-items: center;
-  gap: 6px;
-  color: rgba(255, 255, 255, 0.86);
-  background: linear-gradient(135deg, rgba(47, 128, 237, 0.32), rgba(0, 166, 180, 0.28));
+  gap: 12px;
+  background: linear-gradient(160deg, #18324a, #0d1620);
+  color: rgba(255, 255, 255, 0.8);
   text-align: center;
-  padding: 12px;
+  padding: 16px;
 }
+/* hidden 属性要真正隐藏：作者样式的 display 会盖过 UA 的 [hidden]{display:none}，
+   所以显式补一条更高优先级的规则，否则占位板会一直盖住摄像头画面。 */
+.video-call-self-placeholder[hidden] { display: none; }
 
-.video-call-avatar {
+.video-call-self-avatar {
   display: grid;
   place-items: center;
-  width: 64px;
-  height: 64px;
+  width: 74px;
+  height: 74px;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.18);
-  font-size: 24px;
+  background: rgba(255, 255, 255, 0.14);
+  font-size: 26px;
   font-weight: 600;
   color: #fff;
 }
 
-.video-call-label {
-  font-size: 15px;
-  font-weight: 500;
+.video-call-hint {
+  font-size: 13px;
+  color: rgba(255, 255, 255, 0.72);
 }
 
-.video-call-hint {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.72);
+/* 上下渐变压暗，保证文字/按钮在任意画面上都清晰 */
+.video-call-scrim {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(6, 12, 18, 0.55) 0%, rgba(6, 12, 18, 0) 22%),
+    linear-gradient(0deg, rgba(6, 12, 18, 0.72) 0%, rgba(6, 12, 18, 0) 34%);
+}
+
+.video-call-topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: calc(14px + env(safe-area-inset-top)) 16px 14px;
+}
+
+.video-call-peer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.video-call-peer-avatar {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #2f80ed, #00a6b4);
+  font-size: 17px;
+  font-weight: 600;
+  color: #fff;
+  flex: none;
+}
+
+.video-call-peer-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.video-call-peer-name {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.video-call-peer-status {
+  font-size: 12.5px;
+  color: rgba(255, 255, 255, 0.7);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 62vw;
+}
+
+.video-call-close {
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 0;
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+}
+.video-call-close:hover { background: rgba(255, 255, 255, 0.26); }
+
+.video-call-center {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 172px;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: 16px;
+  padding: 0 20px;
+  pointer-events: none;
+}
+
+.video-call-listening { display: flex; gap: 7px; }
+.video-call-listening span {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.85);
+  animation: vc-bounce 1.2s infinite ease-in-out both;
+}
+.video-call-listening span:nth-child(1) { animation-delay: -0.24s; }
+.video-call-listening span:nth-child(2) { animation-delay: -0.12s; }
+@keyframes vc-bounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: 0.45; }
+  40% { transform: translateY(-7px); opacity: 1; }
+}
+
+.video-call-caption {
+  margin: 0;
+  max-width: 92%;
+  text-align: center;
+  font-size: 15px;
+  line-height: 1.5;
+  color: #fff;
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.55);
+}
+
+.video-call-dock {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 0 16px calc(20px + env(safe-area-inset-bottom));
 }
 
 .video-call-controls {
   display: flex;
+  align-items: flex-end;
   justify-content: center;
-  gap: 12px;
+  gap: 26px;
 }
 
-.video-call-controls button {
-  min-width: 110px;
+.vc-btn {
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
 }
 
-.video-call-controls .danger {
-  border-color: var(--danger, #d9534f);
-  color: var(--danger, #d9534f);
+.vc-ico {
+  display: grid;
+  place-items: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(6px);
+  transition: background 0.15s, transform 0.1s;
+}
+.vc-ico svg { width: 25px; height: 25px; }
+.vc-btn:hover .vc-ico { background: rgba(255, 255, 255, 0.26); }
+.vc-btn:active .vc-ico { transform: scale(0.94); }
+.vc-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+.vc-btn[disabled]:hover .vc-ico { background: rgba(255, 255, 255, 0.16); }
+.vc-btn-label { font-size: 12.5px; color: rgba(255, 255, 255, 0.85); }
+.vc-btn.is-active .vc-ico { background: #fff; color: #0d1620; }
+
+.vc-btn-camera .vc-ico {
+  width: 68px;
+  height: 68px;
+  background: #fff;
+  color: #0d1620;
+}
+.vc-btn-camera:hover .vc-ico { background: #f0f2f4; }
+.vc-btn-camera.is-off .vc-ico { background: rgba(255, 255, 255, 0.16); color: #fff; }
+
+.vc-btn-danger .vc-ico { background: #fa5151; color: #fff; }
+.vc-btn-danger:hover .vc-ico { background: #e84a4a; }
+
+.video-call-disclaimer {
+  margin: 0;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.45);
 }
 
 .upload-request-card {
@@ -3753,7 +3944,7 @@ button {
     height: 100vh;
     height: 100dvh;
     max-height: none;
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
     gap: 14px;
     padding: calc(18px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom));
     overflow: auto;
@@ -3780,7 +3971,7 @@ button {
     height: 100vh;
     height: 100dvh;
     max-height: none;
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
     padding: calc(18px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom));
     overflow: auto;
   }
@@ -4503,21 +4694,19 @@ button {
     font-size: 13px;
   }
 
+  /* 通话界面移动端：真·全屏，控制栏保持横向圆形排布 */
   .video-call-modal {
-    overflow-y: auto;
-  }
-
-  .video-call-stage {
-    min-height: 0;
+    overflow: hidden;
+    padding: 0;
+    border-radius: 0;
   }
 
   .video-call-controls {
-    display: grid;
-    grid-template-columns: 1fr;
+    gap: 20px;
   }
 
-  .video-call-controls button {
-    width: 100%;
+  .video-call-center {
+    bottom: 184px;
   }
 
   .composer-inner,
@@ -4755,3 +4944,4 @@ button {
   font-size: 12px;
   line-height: 1.5;
 }
+

@@ -44,3 +44,8 @@ execute_100_round_test.py
 run_100_round_test.py
 run-customer-manager.sh
 output/
+
+# TLS 证书（私钥，勿提交）
+deploy/certs/*.pem
+deploy/certs/*.crt
+deploy/certs/*.key
