@@ -63,11 +63,14 @@ IMAGE_KB_TXT_THRESHOLD = float(os.environ.get("CUSTOMER_MANAGER_IMG_KB_TXT_THRES
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "").strip()
 DASHSCOPE_EMBED_MODEL = os.environ.get("DASHSCOPE_EMBED_MODEL", "qwen3-vl-embedding").strip()
 DASHSCOPE_ASR_MODEL = os.environ.get("DASHSCOPE_ASR_MODEL", "qwen3-asr-flash").strip()
-# 视频通话模块（路线1 MVP）：火山方舟(Ark) Doubao 多模态模型，既当大脑又看摄像头帧。
-# RealtimeVoice / ASR-2.0 是另一套 openspeech 凭证，这里暂用浏览器原生语音占位。
+# 视频通话模块：火山方舟(Ark) Doubao 多模态模型，既当大脑又看摄像头帧。
 ARK_API_KEY = os.environ.get("ARK_API_KEY", "").strip()
 ARK_BASE_URL = os.environ.get("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").strip()
 VOICECALL_MODEL = os.environ.get("WEWALLET_VOICECALL_MODEL", "doubao-seed-2-0-pro-260215").strip()
+# 看摄像头帧的视觉模型（describe_frame 用）：Doubao 多模态，走 Ark /chat/completions。
+ARK_VISION_MODEL = os.environ.get("WEWALLET_ARK_VISION_MODEL", "doubao-1.6-vision").strip()
+# 看画面用哪家：ark（Doubao doubao-1.6-vision）| stepfun（step-3.7-flash）。
+VOICECALL_VISION_PROVIDER = os.environ.get("WEWALLET_VOICECALL_VISION_PROVIDER", "ark").strip().lower()
 # StepFun(阶跃星辰)：另一套 OpenAI 兼容的通话大脑，可整体平替 Ark。
 #   - step-3.7-flash：旗舰多模态推理模型，原生支持图片，能看摄像头帧 → 当大脑。
 #   - stepaudio-2.5-realtime：端到端实时语音模型（WebSocket），是日后替换浏览器
@@ -80,8 +83,8 @@ STEP_REALTIME_MODEL = os.environ.get("WEWALLET_STEP_REALTIME_MODEL", "stepaudio-
 STEP_REALTIME_VOICE = os.environ.get("WEWALLET_STEP_REALTIME_VOICE", "jingdiannvsheng").strip()
 # 通话大脑用哪家：ark（火山方舟 Doubao）| stepfun（阶跃 step-3.7-flash）。
 VOICECALL_PROVIDER = os.environ.get("WEWALLET_VOICECALL_PROVIDER", "ark").strip().lower()
-# 端到端实时语音中继：浏览器 WebSocket 设不了 Authorization header，且 key 不能进前端，
-# 所以本地起一个 asyncio WS 中继（voicecall_relay.py）：浏览器 ⇄ 中继(加 Bearer) ⇄ StepFun。
+# 端到端实时语音中继：浏览器 WebSocket 设不了请求头，且凭证不能进前端，所以本地起一个
+# asyncio WS 中继（voicecall_relay.py）：浏览器 ⇄ 中继(注入凭证) ⇄ 上游(豆包/StepFun)。
 # 中继和 server.py 同进程跑在独立线程，监听独立端口。
 STEP_REALTIME_WSS = os.environ.get(
     "WEWALLET_STEP_REALTIME_WSS",
@@ -96,8 +99,44 @@ VOICECALL_RELAY_PORT = int(os.environ.get("WEWALLET_VOICECALL_RELAY_PORT", "8789
 #   3) 都不设：本地开发，前端按 ws://<当前主机名>:<RELAY_PORT> 直连。
 VOICECALL_RELAY_PUBLIC_URL = os.environ.get("WEWALLET_VOICECALL_RELAY_PUBLIC_URL", "").strip()
 VOICECALL_RELAY_PATH = os.environ.get("WEWALLET_VOICECALL_RELAY_PATH", "").strip()
-# 通话语音后端：realtime（端到端 stepaudio）| placeholder（浏览器原生 STT/TTS 占位）。
-# realtime 需要 STEP_API_KEY；缺 key 时前端自动回落 placeholder。
+# ── 端到端实时语音·豆包 openspeech 实时对话（volc.speech.dialog）──
+# 字节跳动 openspeech 的「实时对话大模型」：ASR+LLM+TTS 一体，二进制帧协议（非 OpenAI
+# 兼容），由 voicecall_doubao.py 编解码、voicecall_relay.py 桥接。鉴权用 App ID + Access
+# Key（控制台「实时对话」开通后获取）；也兼容只填 X-Api-Key 的新版鉴权。
+DOUBAO_REALTIME_WS_URL = os.environ.get(
+    "WEWALLET_DOUBAO_REALTIME_WS_URL",
+    "wss://openspeech.bytedance.com/api/v3/realtime/dialogue",
+).strip()
+DOUBAO_REALTIME_APP_ID = os.environ.get("DOUBAO_REALTIME_APP_ID", "").strip()
+DOUBAO_REALTIME_ACCESS_KEY = os.environ.get("DOUBAO_REALTIME_ACCESS_KEY", "").strip()
+DOUBAO_REALTIME_API_KEY = os.environ.get("DOUBAO_REALTIME_API_KEY", "").strip()
+DOUBAO_REALTIME_APP_KEY = os.environ.get("DOUBAO_REALTIME_APP_KEY", "PlgvMymc7f3tQnJ6").strip()
+DOUBAO_REALTIME_RESOURCE_ID = os.environ.get("DOUBAO_REALTIME_RESOURCE_ID", "volc.speech.dialog").strip()
+DOUBAO_REALTIME_MODEL_VERSION = os.environ.get("WEWALLET_DOUBAO_REALTIME_MODEL_VERSION", "1.2.1.1").strip()
+# TTS 音色（speaker）。zh_female_vv_jupiter_bigtts=自然女声；可换其它 bigtts 音色。
+DOUBAO_REALTIME_TTS_SPEAKER = os.environ.get("WEWALLET_DOUBAO_REALTIME_TTS_SPEAKER", "zh_female_vv_jupiter_bigtts").strip()
+# 降延迟两项（见 voicecall_doubao.build_session_config）：判定"说完"的静音窗口 ms（600 默认偏慢，
+# 400 更快接话）；ASR 两遍（更准但更慢，默认关）。停顿被抢话就把窗口调大、转写变糙就开 twopass。
+DOUBAO_REALTIME_END_WINDOW_MS = int(os.environ.get("WEWALLET_DOUBAO_REALTIME_END_WINDOW_MS", "400"))
+DOUBAO_REALTIME_ASR_TWOPASS = os.environ.get("WEWALLET_DOUBAO_REALTIME_ASR_TWOPASS", "0").strip() in {"1", "true", "True"}
+# 实时语音用哪家：doubao（openspeech 实时对话）| stepfun（stepaudio-2.5-realtime）。
+VOICECALL_REALTIME_PROVIDER = os.environ.get("WEWALLET_VOICECALL_REALTIME_PROVIDER", "doubao").strip().lower()
+
+
+def doubao_realtime_ready() -> bool:
+    """豆包实时对话凭证是否齐全（App ID+Access Key，或新版 X-Api-Key）。"""
+    return bool((DOUBAO_REALTIME_APP_ID and DOUBAO_REALTIME_ACCESS_KEY) or DOUBAO_REALTIME_API_KEY)
+
+
+def realtime_voice_ready() -> bool:
+    """当前所选实时语音 provider 的凭证是否齐全（决定 realtime 后端能否启用）。"""
+    if VOICECALL_REALTIME_PROVIDER == "stepfun":
+        return bool(STEP_API_KEY)
+    return doubao_realtime_ready()
+
+
+# 通话语音后端：realtime（端到端实时语音）| placeholder（浏览器原生 STT/TTS 占位）。
+# realtime 需要所选 provider 的凭证；缺凭证时前端自动回落 placeholder。
 VOICECALL_VOICE_BACKEND = os.environ.get("WEWALLET_VOICECALL_VOICE_BACKEND", "realtime").strip().lower()
 # 中继访问令牌：中继本身不带鉴权，公网暴露时谁连上都能用你的 STEP_API_KEY。所以要求
 # 连接带对 token——登录后的前端从 /api/voicecall/realtime-config（需登录）领，中继校验。

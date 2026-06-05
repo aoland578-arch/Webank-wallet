@@ -86,13 +86,13 @@ from uploads import display_user_message, sanitize_filename, upload_metadata
 from asr import transcribe_audio
 from voicecall import call_xiaowei
 from config import (
-    STEP_API_KEY,
     VOICECALL_RELAY_HOST,
     VOICECALL_RELAY_PORT,
     VOICECALL_RELAY_PUBLIC_URL,
     VOICECALL_RELAY_PATH,
     VOICECALL_RELAY_TOKEN,
     VOICECALL_VOICE_BACKEND,
+    realtime_voice_ready,
 )
 from wallet import (
     apply_pending,
@@ -279,9 +279,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/voicecall/realtime-config":
                 # 告诉前端通话语音走哪条路 + 实时中继地址 + 访问令牌（仅发给已登录用户；
-                # 令牌不是密钥，但能挡住公网上对中继的盗用，避免别人白嫖 STEP_API_KEY）。
+                # 令牌不是密钥，但能挡住公网上对中继的盗用，避免别人白嫖上游凭证）。
                 logged_in = bool(verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME)))
-                enabled = logged_in and VOICECALL_VOICE_BACKEND == "realtime" and bool(STEP_API_KEY)
+                enabled = logged_in and VOICECALL_VOICE_BACKEND == "realtime" and realtime_voice_ready()
                 self.send_json({
                     "backend": "realtime" if enabled else "placeholder",
                     "enabled": enabled,
@@ -1050,7 +1050,7 @@ def main() -> None:
     if server is None:
         raise OSError(f"No available port in range {preferred_port}-{preferred_port + 19}")
     start_gateway_sweeper()
-    # 端到端实时语音中继（缺 STEP_API_KEY 则不启，前端自动回落占位语音）。
+    # 端到端实时语音中继（缺所选 provider 凭证则不启，前端自动回落占位语音）。
     try:
         from voicecall_relay import start_relay_thread
         if start_relay_thread():

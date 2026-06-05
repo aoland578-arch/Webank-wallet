@@ -5,10 +5,11 @@
  * 不覆盖 chat.js 已绑定的 onclick。
  *
  * 两套语音引擎，启动时按后端 /api/voicecall/realtime-config 自动选：
- *   1) realtime（首选）：端到端实时语音 stepaudio-2.5-realtime。
- *      麦克风 → PCM16/24kHz → WebSocket 中继(/api/voicecall/realtime-config 给地址) →
- *      StepFun → 回传 PCM16 音频边收边放 + 字幕。server_vad 自动断句、可打断。
- *      看材料：截一帧发 {type:"vision.frame"}，中继调 step-3.7-flash 描述后注入会话，
+ *   1) realtime（首选）：端到端实时语音（豆包 openspeech 实时对话，或 StepFun stepaudio）。
+ *      麦克风 → PCM16/16kHz → WebSocket 中继(/api/voicecall/realtime-config 给地址) → 上游 →
+ *      回传 PCM16/24kHz 音频边收边放 + 字幕。服务端 VAD 自动断句、可打断。
+ *      ⚠️ 采集 16kHz、播放 24kHz（豆包 ASR 收 16k、TTS 出 24k），故用两个 AudioContext。
+ *      看材料：截一帧发 {type:"vision.frame"}，中继调多模态视觉描述后注入会话，
  *      小微当场"看到并转述"。
  *   2) placeholder（回落）：浏览器原生 Web Speech API 做 STT/TTS（无 STEP_API_KEY 或
  *      浏览器不支持时）。即旧版形态。
@@ -34,7 +35,9 @@
   if (!talkButton) return; // 没有按钮就不挂（防御）
 
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  const RATE = 24000; // stepaudio-2.5-realtime 的 PCM16 采样率
+  // 上游 ASR 收 16kHz、TTS 出 24kHz：采集和播放用不同采样率的 AudioContext。
+  const CAPTURE_RATE = 16000; // 麦克风采集 → 上行（豆包 ASR 要求 16k）
+  const PLAYBACK_RATE = 24000; // 下行 TTS 音频（豆包/stepaudio 都出 24k）
 
   const call = {
     active: false,
@@ -128,13 +131,9 @@
   }
 
   // ── PCM16 <-> base64 工具 ───────────────────────────────────────────────
-  function floatTo16BitBase64(float32) {
-    const out = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      const s = Math.max(-1, Math.min(1, float32[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    const bytes = new Uint8Array(out.buffer);
+  // worklet 已把麦克风转成 Int16 PCM16，这里只做 ArrayBuffer → base64。
+  function pcm16BufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
     let bin = "";
     for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
     return btoa(bin);
@@ -150,20 +149,39 @@
     return f32;
   }
 
+  // 一帧 PCM16 的平均能量（0~1），用于 barge-in 判断用户是否在说话。
+  function pcm16Level(int16) {
+    if (!int16.length) return 0;
+    let sum = 0;
+    for (let i = 0; i < int16.length; i++) sum += Math.abs(int16[i]) / 32768;
+    return Math.min(1, (sum / int16.length) * 5);
+  }
+
   // ════════════════════════════════════════════════════════════════════════
   // 引擎 1：实时语音（stepaudio-2.5-realtime，经本地中继）
   // ════════════════════════════════════════════════════════════════════════
   function RealtimeEngine(wsUrl) {
     let ws = null;
-    let audioCtx = null;
+    let captureCtx = null; // 麦克风采集上下文（16kHz）
+    let playCtx = null; // TTS 播放上下文（24kHz）
     let micSource = null;
-    let processor = null;
+    let workletNode = null; // PCM 采集 worklet 节点（取代已废弃的 ScriptProcessor）
     let nextPlayTime = 0; // 播放调度游标
     const sources = new Set(); // 已排期的播放节点，便于打断时停掉
     let selfCaption = ""; // 小微当前句子字幕累积
+    let gotSubtitle = false; // 本轮是否收到过 TTS 字幕事件（有就不用文本兜底，避免字幕翻倍）
     let lastAutoVision = 0; // 上次自动看画面的时间戳（节流）
     let visionBusy = false; // 一次看画面在途，避免叠发
     const AUTO_VISION_MIN_GAP_MS = 3000; // 每轮看一眼，但最快 3 秒一次
+
+    // ── 本地 barge-in 闸门 ──────────────────────────────────────────────────
+    // 小微说话时，麦克风会录到她自己的声音（回声消除挡不全）。若原样上传，服务端 VAD
+    // 会把这段回声当成"用户在说话"而误打断她。所以她说话期间默认把麦克风压成静音，只有
+    // 用户**持续够响**（真想插话）才放行，并本地立即停播实现打断。
+    let aiSpeakingUntil = 0; // 预计小微播放到的时间戳（>now 表示她正在说）
+    let bargeFrames = 0; // 用户连续够响的帧数
+    const BARGE_LEVEL = 0.14; // 判为"用户在说话"的能量阈值
+    const BARGE_MIN_FRAMES = 2; // 需连续这么多帧（帧≈43ms，约 86ms）才放行打断，滤掉瞬态噪声
 
     // 每轮自动看一眼：你一开口就截一帧静默发给中继，等你说完小微回应时已看到当前画面。
     function autoVision() {
@@ -183,21 +201,24 @@
       }
       sources.clear();
       nextPlayTime = 0;
+      aiSpeakingUntil = 0; // 已停播，立刻恢复正常上传麦克风
     }
 
     function playDelta(f32) {
-      if (!audioCtx || !f32.length) return;
-      const buf = audioCtx.createBuffer(1, f32.length, RATE);
+      if (!playCtx || !f32.length) return;
+      const buf = playCtx.createBuffer(1, f32.length, PLAYBACK_RATE);
       buf.copyToChannel(f32, 0);
-      const src = audioCtx.createBufferSource();
+      const src = playCtx.createBufferSource();
       src.buffer = buf;
-      src.connect(audioCtx.destination);
-      const now = audioCtx.currentTime;
+      src.connect(playCtx.destination);
+      const now = playCtx.currentTime;
       if (nextPlayTime < now) nextPlayTime = now;
       src.start(nextPlayTime);
       nextPlayTime += buf.duration;
       sources.add(src);
       src.onended = () => sources.delete(src);
+      // 标记小微预计播放到何时（+400ms 余量），barge-in 闸门据此判断她是否在说话。
+      aiSpeakingUntil = Date.now() + Math.max(0, nextPlayTime - now) * 1000 + 400;
     }
 
     function handleEvent(ev) {
@@ -212,12 +233,27 @@
           if (ev.delta) playDelta(base64ToFloat32(ev.delta));
           break;
         case "response.audio_transcript.delta":
+          gotSubtitle = true;
           selfCaption += ev.delta || "";
           showCaption("小微：" + selfCaption);
+          break;
+        case "response.text.delta":
+          // 字幕兜底：豆包实时对话发的是文本(ChatResponse)而非 TTS 字幕事件，没有
+          // audio_transcript.delta；本轮若没收到字幕事件，就用文本当字幕显示。
+          if (!gotSubtitle) {
+            selfCaption += ev.delta || "";
+            showCaption("小微：" + selfCaption);
+          }
           break;
         case "response.audio_transcript.done":
           if (ev.transcript) showCaption("小微：" + ev.transcript);
           selfCaption = "";
+          gotSubtitle = false;
+          break;
+        case "response.done":
+          // 一轮回复结束：清字幕累积，下一轮重新开始（豆包无 audio_transcript.done）。
+          selfCaption = "";
+          gotSubtitle = false;
           break;
         case "conversation.item.input_audio_transcription.completed":
           if (ev.transcript) setStatus("我：" + ev.transcript);
@@ -236,26 +272,50 @@
     async function start() {
       const stream = await ensureStream();
       if (!stream) throw new Error("无法获取摄像头/麦克风");
-      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
-      if (audioCtx.state === "suspended") await audioCtx.resume();
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      captureCtx = new Ctx({ sampleRate: CAPTURE_RATE });
+      playCtx = new Ctx({ sampleRate: PLAYBACK_RATE });
+      if (captureCtx.state === "suspended") await captureCtx.resume();
+      if (playCtx.state === "suspended") await playCtx.resume();
+      // worklet 模块必须在建节点前加载好（异步）。
+      await captureCtx.audioWorklet.addModule("/static/audio-worklet/pcm-recorder.js");
 
       ws = new WebSocket(wsUrl);
       ws.onopen = () => {
         setStatus("通话已接通，请直接说话，小微在听...");
         setShowDocEnabled(true);
-        // 麦克风采集 → PCM16 → input_audio_buffer.append
-        micSource = audioCtx.createMediaStreamSource(stream);
-        processor = audioCtx.createScriptProcessor(4096, 1, 1);
-        processor.onaudioprocess = (e) => {
+        // 麦克风采集（worklet 音频线程）→ PCM16 块 → input_audio_buffer.append
+        micSource = captureCtx.createMediaStreamSource(stream);
+        workletNode = new AudioWorkletNode(captureCtx, "pcm-recorder");
+        workletNode.port.onmessage = (e) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
-          const input = e.inputBuffer.getChannelData(0);
+          let outBuf = e.data; // 默认转发真实麦克风音频
+          if (Date.now() < aiSpeakingUntil) {
+            // 小微正在说话：默认压成静音，避免她的声音被麦克风录回去误触发打断。
+            const level = pcm16Level(new Int16Array(e.data));
+            if (level >= BARGE_LEVEL) {
+              bargeFrames += 1;
+              if (bargeFrames >= BARGE_MIN_FRAMES) {
+                stopPlayback(); // 用户确实想插话 → 本地立即停播，本帧起转发真实音频
+                bargeFrames = 0;
+              } else {
+                outBuf = new ArrayBuffer(e.data.byteLength); // 还没够帧，先发静音
+              }
+            } else {
+              bargeFrames = 0;
+              outBuf = new ArrayBuffer(e.data.byteLength); // 不够响：发静音
+            }
+          } else {
+            bargeFrames = 0;
+          }
           ws.send(JSON.stringify({
             type: "input_audio_buffer.append",
-            audio: floatTo16BitBase64(input),
+            audio: pcm16BufferToBase64(outBuf),
           }));
         };
-        micSource.connect(processor);
-        processor.connect(audioCtx.destination); // ScriptProcessor 需接入图才触发
+        micSource.connect(workletNode);
+        // worklet 不输出声音（process 不写 outputs），接到 destination 只为让它被调度、不会回放。
+        workletNode.connect(captureCtx.destination);
       };
       ws.onmessage = (e) => {
         let data;
@@ -276,17 +336,22 @@
 
     function stop() {
       stopPlayback();
-      try { processor && processor.disconnect(); } catch (e) {}
+      try { workletNode && workletNode.disconnect(); } catch (e) {}
       try { micSource && micSource.disconnect(); } catch (e) {}
-      processor = null;
+      if (workletNode) workletNode.port.onmessage = null;
+      workletNode = null;
       micSource = null;
       if (ws) {
         try { ws.close(); } catch (e) {}
         ws = null;
       }
-      if (audioCtx) {
-        try { audioCtx.close(); } catch (e) {}
-        audioCtx = null;
+      if (captureCtx) {
+        try { captureCtx.close(); } catch (e) {}
+        captureCtx = null;
+      }
+      if (playCtx) {
+        try { playCtx.close(); } catch (e) {}
+        playCtx = null;
       }
     }
 

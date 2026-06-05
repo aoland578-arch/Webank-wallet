@@ -1,54 +1,331 @@
-"""端到端实时语音（stepaudio-2.5-realtime）的 WebSocket 中继。
+"""端到端实时语音的 WebSocket 中继（豆包 openspeech 实时对话 / StepFun stepaudio）。
 
-为什么需要中继：浏览器原生 WebSocket **不能自定义请求头**，没法带
-``Authorization: Bearer``；而且 API key 绝不能下发到前端。所以这里起一个本地
-asyncio WS 服务：
+为什么需要中继：浏览器原生 WebSocket **不能自定义请求头**，没法带鉴权；而且凭证绝不能
+下发到前端。所以这里起一个本地 asyncio WS 服务：
 
-    浏览器  ⇄  本中继（注入 Bearer key）  ⇄  StepFun 实时语音 wss
+    浏览器  ⇄  本中继（注入凭证 + 协议翻译）  ⇄  上游实时语音 wss
 
-中继做三件事：
-1. 客户端一连上，就替它打开上游 StepFun 连接并发 ``session.update``（小微人设/音色/
-   server_vad 断句），之后双向**原样转发**所有 OpenAI-realtime 协议事件。
-2. **视觉桥接**：stepaudio 看不了图。前端把客户举到镜头前的一帧用自定义事件
-   ``{"type":"vision.frame","frame":"data:image/jpeg;base64,..."}`` 发上来，中继
-   **截下不转发**，改调 step-3.7-flash（``voicecall.describe_frame``）把画面关键信息
-   描述出来，再以一条 ``[画面]`` 开头的文字消息注入上游会话并 ``response.create``，
-   让小微当场"看到并转述"。同时回一条 ``vision.described`` 给前端做字幕。
-3. 缺 ``STEP_API_KEY`` 时直接拒连，让前端回落到浏览器占位语音。
+前端和中继之间用一套**抽象事件协议**（input_audio_buffer.append / response.audio.delta /
+response.audio_transcript.delta / vision.frame …），中继负责把它翻成上游各自的协议，所以
+切换 provider 前端基本不用动。按 ``VOICECALL_REALTIME_PROVIDER`` 选上游：
+
+  - doubao（默认）：字节 openspeech「实时对话」(volc.speech.dialog)，**二进制帧协议**，
+    ASR+LLM+TTS 一体。编解码在 voicecall_doubao.py。
+  - stepfun：stepaudio-2.5-realtime，OpenAI-realtime JSON 协议。
+
+**视觉桥接**：实时语音模型看不了图。前端把客户举到镜头前的一帧用 ``vision.frame`` 事件发上来，
+中继截下不转发，改调多模态视觉（voicecall.describe_frame，默认 doubao-1.6-vision）把画面关键
+信息描述出来，再以一条 ``[画面]`` 开头的文字注入上游会话：
+  - auto=True（每轮自动看）：静默注入当上下文，吞掉本轮播报，只更新小微"视觉记忆"，不打断；
+  - auto=False（手动看材料）：注入 caption + 反欺诈核验提示，让她当场看着材料开口。
 
 随 server.py 同进程、独立线程、独立端口运行（见 ``start_relay_thread``）。
-依赖 ``websockets``（仅 python3.13 环境有）。
+依赖 ``websockets``。
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import secrets
 import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import websockets
 from websockets.asyncio.client import connect as ws_connect
 from websockets.asyncio.server import serve as ws_serve
 
+import voicecall_doubao as dbq
 from config import (
+    DOUBAO_REALTIME_ACCESS_KEY,
+    DOUBAO_REALTIME_API_KEY,
+    DOUBAO_REALTIME_APP_ID,
+    DOUBAO_REALTIME_APP_KEY,
+    DOUBAO_REALTIME_ASR_TWOPASS,
+    DOUBAO_REALTIME_END_WINDOW_MS,
+    DOUBAO_REALTIME_MODEL_VERSION,
+    DOUBAO_REALTIME_RESOURCE_ID,
+    DOUBAO_REALTIME_TTS_SPEAKER,
+    DOUBAO_REALTIME_WS_URL,
     STEP_API_KEY,
     STEP_REALTIME_WSS,
+    VOICECALL_REALTIME_PROVIDER,
     VOICECALL_RELAY_HOST,
     VOICECALL_RELAY_PORT,
     VOICECALL_RELAY_TOKEN,
+    realtime_voice_ready,
 )
-from voicecall import describe_frame, realtime_session_config
+from voicecall import REALTIME_INSTRUCTIONS, describe_frame, realtime_session_config
 
 
-class _Bridge:
+# 对小微贷申请人"自称在经营场所"而言偏可疑的场景类型（与 _VISION_STRUCTURED_PROMPT 的
+# place_type 取值对齐）：在这些场景下，画面与"开厂/店面/营业"的口述更可能对不上。
+_NON_BUSINESS_SCENES = {"居住/家", "车内"}
+
+
+def _caption_with_scene(caption: str, observation: dict[str, Any] | None) -> str:
+    """把**结构化硬事实**（有没有人/几个人、场景类型）并进 [画面] 旁白，让小微每轮都拿到
+    可靠的客观依据——而不是只给一句可能没提到人的 caption。这是"以画面为准、不轻信用户"
+    的前提：用户声称"我这有5个人"但画面没人时，小微据此才能纠正。
+
+    保留 "[画面]" 前缀（人设约定当亲眼所见、且不读出方括号）。看不清/未知的字段不写。
+    """
+    obs = observation or {}
+    bits: list[str] = []
+
+    # 人物：最容易被用户口头"注水"的事实，明确写出有没有人、几个人。
+    present = obs.get("person_present")
+    count = obs.get("person_count")
+    has_count = isinstance(count, (int, float)) and not isinstance(count, bool)
+    if present is True or (has_count and count > 0):
+        n = int(count) if has_count and count > 0 else None
+        bits.append(f"画面里可见约{n}人" if n else "画面里可见人物")
+    elif present is False or (has_count and count == 0):
+        bits.append("画面里没看到人")
+
+    pt = str(obs.get("place_type") or "").strip()
+    if pt and pt != "看不清":
+        bits.append(f"场景看着像{pt}")
+
+    prefix = "（" + "；".join(bits) + "）" if bits else " "
+    return "[画面]" + prefix + caption
+
+
+def _verify_hint(observation: dict[str, Any] | None) -> str:
+    """据结构化视觉信号，生成给小微的**静默核验提示**（反欺诈交叉核验）。
+
+    以"（核验提示…）"开头：人设里约定这类内容是内部指引，绝不读出来，按它去做。
+    没有可操作信号则返回 ""（不注入，省 token、不刷历史）。
+    """
+    if not observation:
+        return ""
+    bits: list[str] = []
+    docs = [str(d) for d in observation.get("visible_documents") or [] if str(d).strip()]
+    if docs:
+        bits.append(
+            "对方出示了" + "、".join(docs[:3]) +
+            "，请让对方对准镜头并【口头念出上面的关键信息】（名称/日期/金额等），用念的和看到的互相核对，别只看不问"
+        )
+    if observation.get("looking_off_screen"):
+        bits.append("对方似乎频繁看别处或像在照稿念，自然地多问一两句开放问题印证，别点破")
+    # 画面 vs 口述场景：场景偏居家/车内时，和对方自称的经营情况对一下。明显对不上要客观直指。
+    place_type = str(observation.get("place_type") or "").strip()
+    if place_type in _NON_BUSINESS_SCENES:
+        bits.append(
+            f"画面场景像{place_type}，不太像营业/经营场所——若对方自称在开厂/店面经营、生意红火等"
+            "明显对不上，**客观、直接地指出**这个不符并当场要求核实（如'我看您这边像是在家里，跟您说的"
+            "在店面经营对不上，麻烦您说说现在什么情况，或把经营场所拍给我看下'），别绕弯子别给模糊台阶；"
+            "但别用'骗贷/造假/欺诈'这类定性词，口径对上或给出证据才往下推进"
+        )
+    anomalies = [str(a) for a in observation.get("anomalies") or [] if str(a).strip()]
+    if anomalies:
+        bits.append("画面有疑点（" + "、".join(anomalies[:3]) + "），用温和确认口径的方式核对，别说破")
+    if not bits:
+        return ""
+    return "（核验提示，仅你自己看、绝不要读出来）" + "；".join(bits) + "。"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 上游 1：豆包 openspeech 实时对话（二进制帧协议）
+# ══════════════════════════════════════════════════════════════════════════
+class _DoubaoBridge:
+    """一条浏览器⇄豆包连接的共享状态。
+
+    suppress_until：静默喂画面那轮的"吞播报"截止时刻（monotonic）。auto 看画面会以
+    ChatTextQuery 注入画面文字、触发一次回复，但我们不想让她开口播报，于是在这段窗口内吞掉
+    文字/音频，只让豆包把画面收进上下文。用户一开口（ASR）立即解除，避免吞掉真实回答。
+    """
+
+    def __init__(self, browser: Any, upstream: Any, session_id: str) -> None:
+        self.browser = browser
+        self.upstream = upstream
+        self.session_id = session_id
+        self.session_started = False
+        self.ai_speaking = False
+        self.suppress_until = 0.0
+        self.last_vision_desc = ""
+        self.last_vision_at = 0.0  # 上次注入画面的时刻（monotonic），用于"静态场景也定期刷新事实"
+        # 用户当前是否在"一段语音"中：一句话有几十个 interim ASR 帧，只在起点动作一次
+        # （发 speech_started + 打断），整段不重复，避免把小微切碎。ASR_ENDED 时复位。
+        self.user_turn_active = False
+
+
+_SUPPRESS_SECONDS = 8.0  # 吞画面播报的安全上限，防漏掉结束事件后一直静音
+# 静态场景也定期刷新画面事实：即便事实没变，超过这个间隔也重注一次，避免"无人/人数"被
+# 对话截断挤出小微的活跃上下文，导致用户口头注水时她手里没有反驳依据。
+_VISION_REFRESH_S = 12.0
+
+
+async def _inject_vision_doubao(bridge: _DoubaoBridge, frame: str, auto: bool) -> None:
+    """看画面：一帧 → 多模态结构化观察 → 以 ChatTextQuery 注入豆包会话 + 反欺诈核验提示。"""
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, describe_frame, frame)  # 阻塞 requests，丢线程池
+    caption = str(result.get("caption") or "看不清。")
+    observation = result.get("observation")
+    try:
+        await bridge.browser.send(json.dumps({
+            "type": "vision.described", "text": caption, "observation": observation, "auto": auto,
+        }))
+    except Exception:
+        pass
+    base = _caption_with_scene(caption, observation)  # 含"有没有人/几个人/场景"硬事实
+    now = time.monotonic()
+    # 自动模式：事实没变且刚注过就跳过；但即便没变，超过刷新间隔也重注一次（保事实常新）。
+    if auto and base == bridge.last_vision_desc and (now - bridge.last_vision_at) < _VISION_REFRESH_S:
+        return
+    bridge.last_vision_desc = base
+    bridge.last_vision_at = now
+
+    content = base
+    if not auto:
+        hint = _verify_hint(observation)
+        if hint:
+            content += "\n" + hint
+    else:
+        # 静默更新视觉记忆：吞掉这轮被触发的播报。
+        bridge.suppress_until = time.monotonic() + _SUPPRESS_SECONDS
+
+    await bridge.upstream.send(
+        dbq.make_full_client_frame(dbq.EVENT_CHAT_TEXT_QUERY, {"content": content}, bridge.session_id)
+    )
+
+
+async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
+    async for raw in bridge.upstream:
+        if not isinstance(raw, (bytes, bytearray)):
+            continue  # 豆包上游是二进制帧，文本忽略
+        frame = dbq.decode_frame(bytes(raw))
+        if frame is None:
+            await bridge.browser.send(json.dumps({"type": "proxy.warning", "message": "收到无法解析的豆包帧。"}))
+            continue
+
+        # 用户一开口就解除静默，避免把这轮真实回答也吞掉
+        if frame.event == dbq.EVENT_ASR_RESPONSE:
+            bridge.suppress_until = 0.0
+
+        suppressing = bridge.suppress_until > time.monotonic()
+        for payload in dbq.translate_frame(frame):
+            if suppressing and payload.get("type") in (
+                "response.text.delta", "response.audio.delta", "response.audio_transcript.delta",
+            ):
+                continue
+            await bridge.browser.send(json.dumps(payload))
+        # 只在 TTS 真正播完时解除：ChatEnded 早于音频，用它解除会让喂画面那轮的音频漏出来
+        if suppressing and frame.event == dbq.EVENT_TTS_ENDED:
+            bridge.suppress_until = 0.0
+
+        # 跟踪 AI 是否在播报
+        if frame.event in (dbq.EVENT_TTS_SENTENCE_START, dbq.EVENT_TTS_RESPONSE):
+            bridge.ai_speaking = True
+        elif frame.event in (dbq.EVENT_TTS_ENDED, dbq.EVENT_CHAT_ENDED):
+            bridge.ai_speaking = False
+
+        # 用户语音"起点"才动作一次：通知前端停播+截帧（speech_started），并在 AI 正说时打断她。
+        # 整段语音的后续 interim 帧都跳过——否则几十个 interim 会把小微反复掐断。
+        if frame.event == dbq.EVENT_ASR_RESPONSE:
+            if not bridge.user_turn_active:
+                bridge.user_turn_active = True
+                await bridge.browser.send(json.dumps({"type": "input_audio_buffer.speech_started"}))
+                if bridge.ai_speaking and bridge.session_started:
+                    await bridge.upstream.send(
+                        dbq.make_full_client_frame(dbq.EVENT_CLIENT_INTERRUPT, {}, bridge.session_id))
+                    bridge.ai_speaking = False
+        elif frame.event == dbq.EVENT_ASR_ENDED:
+            bridge.user_turn_active = False  # 本段用户语音结束，下段重新允许起点动作
+
+        if frame.event == dbq.EVENT_CONNECTION_STARTED:
+            session_cfg = dbq.build_session_config(
+                REALTIME_INSTRUCTIONS,
+                tts_speaker=DOUBAO_REALTIME_TTS_SPEAKER,
+                model_version=DOUBAO_REALTIME_MODEL_VERSION,
+                end_smooth_window_ms=DOUBAO_REALTIME_END_WINDOW_MS,
+                asr_twopass=DOUBAO_REALTIME_ASR_TWOPASS,
+            )
+            await bridge.upstream.send(
+                dbq.make_full_client_frame(dbq.EVENT_START_SESSION, session_cfg, bridge.session_id))
+        elif frame.event == dbq.EVENT_SESSION_STARTED:
+            bridge.session_started = True
+
+        if dbq.is_failure_event(frame.event):
+            await bridge.browser.close(code=1011, reason="upstream session failed")
+            return
+
+
+async def _pump_doubao_browser(bridge: _DoubaoBridge) -> None:
+    async for msg in bridge.browser:
+        # 二进制：直接当上行音频帧（前端也可能走 base64，见下）
+        if isinstance(msg, (bytes, bytearray)):
+            if bridge.session_started:
+                await bridge.upstream.send(dbq.make_audio_frame(bytes(msg), bridge.session_id))
+            continue
+        try:
+            data = json.loads(msg)
+        except (ValueError, TypeError):
+            continue
+        t = data.get("type")
+        if t == "input_audio_buffer.append" and data.get("audio") and bridge.session_started:
+            try:
+                audio = base64.b64decode(str(data["audio"]))
+            except (ValueError, TypeError):
+                continue
+            await bridge.upstream.send(dbq.make_audio_frame(audio, bridge.session_id))
+        elif t == "vision.frame":
+            await _inject_vision_doubao(bridge, str(data.get("frame") or ""), bool(data.get("auto")))
+        elif t == "response.cancel" and bridge.session_started:
+            await bridge.upstream.send(
+                dbq.make_full_client_frame(dbq.EVENT_CLIENT_INTERRUPT, {}, bridge.session_id))
+        # input_audio_buffer.commit 等忽略：豆包走服务端 VAD 自动断句
+
+
+async def _handle_doubao(browser: Any) -> None:
+    """一个浏览器连接走豆包实时对话：开上游、握手、配会话、双向桥接。"""
+    connect_id = str(uuid4())
+    session_id = str(uuid4())
+    headers = dbq.build_upstream_headers(
+        connect_id,
+        app_id=DOUBAO_REALTIME_APP_ID,
+        access_key=DOUBAO_REALTIME_ACCESS_KEY,
+        api_key=DOUBAO_REALTIME_API_KEY,
+        app_key=DOUBAO_REALTIME_APP_KEY,
+        resource_id=DOUBAO_REALTIME_RESOURCE_ID,
+    )
+    async with ws_connect(
+        DOUBAO_REALTIME_WS_URL,
+        additional_headers=headers,
+        proxy=None,
+        max_size=None,
+    ) as upstream:
+        await upstream.send(dbq.make_full_client_frame(dbq.EVENT_START_CONNECTION, {}, None))
+        bridge = _DoubaoBridge(browser, upstream, session_id)
+        up = asyncio.create_task(_pump_doubao_upstream(bridge))
+        down = asyncio.create_task(_pump_doubao_browser(bridge))
+        try:
+            _done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+        finally:
+            # 收尾：礼貌结束会话与连接
+            try:
+                if bridge.session_started:
+                    await upstream.send(dbq.make_full_client_frame(dbq.EVENT_FINISH_SESSION, {}, session_id))
+                await upstream.send(dbq.make_full_client_frame(dbq.EVENT_FINISH_CONNECTION, {}, None))
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 上游 2：StepFun stepaudio-2.5-realtime（OpenAI-realtime JSON 协议）
+# ══════════════════════════════════════════════════════════════════════════
+class _StepBridge:
     """一条浏览器⇄StepFun 连接的共享状态。
 
-    关键是跟踪小微当前是否有"活跃回复"（response.created…response.done 之间）：
-    实时语音同一时刻只能有一个 response，若在她说话时硬塞 response.create，上游会回
-    ``ongoing response already exists`` 把这次"看材料"的开口丢掉。所以看材料时若她正
-    在说话，就把开口排队到本轮 response.done 之后再触发。
+    跟踪小微当前是否有"活跃回复"（response.created…response.done 之间）：实时语音同一时刻
+    只能有一个 response，若在她说话时硬塞 response.create，上游会回 ``ongoing response
+    already exists`` 把这次"看材料"的开口丢掉。所以看材料时若她正在说话，就排队到本轮
+    response.done 之后再触发。
     """
 
     def __init__(self, browser: Any, upstream: Any) -> None:
@@ -56,47 +333,44 @@ class _Bridge:
         self.upstream = upstream
         self.active_response = False
         self.pending_vision = False
-        self.last_vision_desc = ""  # 上次画面描述，用于去重
+        self.last_vision_desc = ""
 
 
-async def _inject_vision(bridge: _Bridge, frame: str, auto: bool) -> None:
-    """看画面：一帧 → step-3.7-flash 描述 → 注入会话历史。
-
-    auto=True（每轮自动看）：**静默注入**当上下文，不触发 response.create——画面只是
-    更新小微的"视觉记忆"，等她回应你这句话时自然用上，不打断、不抢话；描述与上次相同
-    则跳过，避免刷屏和重复花钱。
-    auto=False（手动"看材料"）：注入后让她当场开口转述，正在说话则排队到说完再触发。
-    """
+async def _inject_vision_step(bridge: _StepBridge, frame: str, auto: bool) -> None:
     loop = asyncio.get_running_loop()
-    # describe_frame 是阻塞的 requests 调用，丢到线程池，别卡住事件循环。
-    description = await loop.run_in_executor(None, describe_frame, frame)
+    result = await loop.run_in_executor(None, describe_frame, frame)
+    caption = str(result.get("caption") or "看不清。")
+    observation = result.get("observation")
     try:
-        await bridge.browser.send(json.dumps({"type": "vision.described", "text": description, "auto": auto}))
+        await bridge.browser.send(json.dumps({
+            "type": "vision.described", "text": caption, "observation": observation, "auto": auto,
+        }))
     except Exception:
         pass
-    # 自动模式下画面没变就不重复注入（省 token、不刷会话历史）。
-    if auto and description == bridge.last_vision_desc:
+    if auto and caption == bridge.last_vision_desc:
         return
-    bridge.last_vision_desc = description
-    # 把画面以文字加进会话历史（任何时候都允许，不会和活跃回复冲突）。
+    bridge.last_vision_desc = caption
     await bridge.upstream.send(json.dumps({
         "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "[画面] " + description}],
-        },
+        "item": {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": _caption_with_scene(caption, observation)}]},
     }))
     if auto:
-        return  # 静默更新视觉记忆，不主动开口
-    # 手动看材料：让她开口转述；正在说话就排队，等本轮说完再触发，避免 response 冲突。
+        return
+    hint = _verify_hint(observation)
+    if hint:
+        await bridge.upstream.send(json.dumps({
+            "type": "conversation.item.create",
+            "item": {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": hint}]},
+        }))
     if bridge.active_response:
         bridge.pending_vision = True
     else:
         await bridge.upstream.send(json.dumps({"type": "response.create"}))
 
 
-async def _pump_upstream_to_browser(bridge: _Bridge) -> None:
+async def _pump_step_upstream(bridge: _StepBridge) -> None:
     async for msg in bridge.upstream:
         if isinstance(msg, str):
             try:
@@ -110,7 +384,6 @@ async def _pump_upstream_to_browser(bridge: _Bridge) -> None:
                 elif t == "response.done":
                     bridge.active_response = False
                     await bridge.browser.send(msg)
-                    # 本轮回复刚结束，若有排队的"看材料"开口，现在触发。
                     if bridge.pending_vision:
                         bridge.pending_vision = False
                         await bridge.upstream.send(json.dumps({"type": "response.create"}))
@@ -118,24 +391,41 @@ async def _pump_upstream_to_browser(bridge: _Bridge) -> None:
         await bridge.browser.send(msg)
 
 
-async def _pump_browser_to_upstream(bridge: _Bridge) -> None:
+async def _pump_step_browser(bridge: _StepBridge) -> None:
     async for msg in bridge.browser:
-        # 二进制（理论上不会有，协议是 JSON）原样转发。
         if isinstance(msg, (bytes, bytearray)):
             await bridge.upstream.send(msg)
             continue
-        # 自定义视觉事件截下来；其余 OpenAI-realtime 事件原样转发。
         try:
             data = json.loads(msg)
         except (ValueError, TypeError):
             await bridge.upstream.send(msg)
             continue
         if data.get("type") == "vision.frame":
-            await _inject_vision(bridge, str(data.get("frame") or ""), bool(data.get("auto")))
+            await _inject_vision_step(bridge, str(data.get("frame") or ""), bool(data.get("auto")))
             continue
         await bridge.upstream.send(msg)
 
 
+async def _handle_stepfun(browser: Any) -> None:
+    async with ws_connect(
+        STEP_REALTIME_WSS,
+        additional_headers={"Authorization": f"Bearer {STEP_API_KEY}"},
+        proxy=None,
+        max_size=None,
+    ) as upstream:
+        await upstream.send(json.dumps({"type": "session.update", "session": realtime_session_config()}))
+        bridge = _StepBridge(browser, upstream)
+        up = asyncio.create_task(_pump_step_upstream(bridge))
+        down = asyncio.create_task(_pump_step_browser(bridge))
+        _done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 连接入口：校验 token → 按 provider 分流
+# ══════════════════════════════════════════════════════════════════════════
 def _token_ok(browser: Any) -> bool:
     """校验连接 query 里的 ?token= 是否匹配（防公网盗用中继）。"""
     try:
@@ -147,31 +437,18 @@ def _token_ok(browser: Any) -> bool:
 
 
 async def _handle_browser(browser: Any) -> None:
-    """一个浏览器连接：校验 token、开上游、配 session、双向转发，任一端断开即收尾。"""
-    if not STEP_API_KEY:
-        await browser.close(code=1011, reason="STEP_API_KEY not configured")
+    """一个浏览器连接：校验 token、按 provider 选上游、双向桥接，任一端断开即收尾。"""
+    if not realtime_voice_ready():
+        await browser.close(code=1011, reason="realtime voice not configured")
         return
     if not _token_ok(browser):
         await browser.close(code=4401, reason="unauthorized")
         return
     try:
-        async with ws_connect(
-            STEP_REALTIME_WSS,
-            additional_headers={"Authorization": f"Bearer {STEP_API_KEY}"},
-            proxy=None,
-            max_size=None,
-        ) as upstream:
-            # 一连上就把小微人设/音色/断句配下去。
-            await upstream.send(json.dumps({
-                "type": "session.update",
-                "session": realtime_session_config(),
-            }))
-            bridge = _Bridge(browser, upstream)
-            up = asyncio.create_task(_pump_upstream_to_browser(bridge))
-            down = asyncio.create_task(_pump_browser_to_upstream(bridge))
-            done, pending = await asyncio.wait({up, down}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
+        if VOICECALL_REALTIME_PROVIDER == "stepfun":
+            await _handle_stepfun(browser)
+        else:
+            await _handle_doubao(browser)
     except websockets.exceptions.WebSocketException:
         try:
             await browser.close(code=1011, reason="upstream error")
@@ -190,8 +467,8 @@ async def serve_relay(host: str = VOICECALL_RELAY_HOST, port: int = VOICECALL_RE
 
 
 def start_relay_thread() -> bool:
-    """在守护线程里跑中继（供 server.py 启动时调用）。缺 key 则不启动，返回是否启动。"""
-    if not STEP_API_KEY:
+    """在守护线程里跑中继（供 server.py 启动时调用）。缺凭证则不启动，返回是否启动。"""
+    if not realtime_voice_ready():
         return False
 
     def _run() -> None:
@@ -205,5 +482,6 @@ def start_relay_thread() -> bool:
 
 
 if __name__ == "__main__":
-    print(f"voicecall relay: ws://{VOICECALL_RELAY_HOST}:{VOICECALL_RELAY_PORT}", flush=True)
+    print(f"voicecall relay ({VOICECALL_REALTIME_PROVIDER}): "
+          f"ws://{VOICECALL_RELAY_HOST}:{VOICECALL_RELAY_PORT}", flush=True)
     asyncio.run(serve_relay())
