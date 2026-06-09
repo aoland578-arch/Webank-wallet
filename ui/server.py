@@ -63,6 +63,7 @@ from security import bucket_for_path, check_csrf, check_rate_limit
 from profile_service import (
     KNOWLEDGE,
     KNOWLEDGE_TOP_K,
+    build_call_memory_context,
     build_gateway_chat_turn,
     extract_upload_request,
     knowledge_progress_events,
@@ -84,7 +85,8 @@ from config import IMAGE_KB_TOP_K
 from storage import save_json_file
 from uploads import display_user_message, sanitize_filename, upload_metadata
 from asr import transcribe_audio
-from voicecall import call_xiaowei
+from voicecall import call_xiaowei, mint_call_token
+from transcript_normalizer import normalize_transcript
 from config import (
     VOICECALL_RELAY_HOST,
     VOICECALL_RELAY_PORT,
@@ -278,10 +280,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if path == "/api/voicecall/realtime-config":
-                # 告诉前端通话语音走哪条路 + 实时中继地址 + 访问令牌（仅发给已登录用户；
-                # 令牌不是密钥，但能挡住公网上对中继的盗用，避免别人白嫖上游凭证）。
-                logged_in = bool(verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME)))
-                enabled = logged_in and VOICECALL_VOICE_BACKEND == "realtime" and realtime_voice_ready()
+                # 告诉前端通话语音走哪条路 + 实时中继地址 + 访问令牌（仅发给已登录用户）。
+                # 令牌现在**绑定该用户的 enterprise_id 并带时效**：既防公网盗用，又让中继
+                # 认得出是哪个企业在通话，从而注入与主聊天共享的客户记忆（见 voicecall.mint_call_token）。
+                auth_user = verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
+                enterprise_id = str((auth_user or {}).get("enterprise_id") or "")
+                # 必须已登录、已绑企业，才能拿到带记忆的令牌（无企业则没有可共享的记忆）。
+                enabled = bool(enterprise_id) and VOICECALL_VOICE_BACKEND == "realtime" and realtime_voice_ready()
                 self.send_json({
                     "backend": "realtime" if enabled else "placeholder",
                     "enabled": enabled,
@@ -289,7 +294,7 @@ class Handler(BaseHTTPRequestHandler):
                     # ws_url(完整) > relay_path(同源路径) > 按 host:relay_port 自拼（本地）。
                     "ws_url": VOICECALL_RELAY_PUBLIC_URL,
                     "relay_path": VOICECALL_RELAY_PATH,
-                    "token": VOICECALL_RELAY_TOKEN if enabled else "",
+                    "token": mint_call_token(enterprise_id) if enabled else "",
                 })
                 return
             if path == "/api/auth/me":
@@ -457,8 +462,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "messages": messages, "suggestions": suggestions})
                 return
             if self.path == "/api/voicecall":
-                # 视频通话模块（通话版小微，独立于主线文字聊天）。
-                self.current_context()  # 仅校验登录态
+                # 视频通话模块（通话版小微）。与主聊天共享同一份记忆：按 enterprise_id
+                # 取画像+近期对话当"开场记忆"注入，让通话小微一接通就认得这位客户。
+                _user, enterprise = self.current_context()
+                enterprise_id = str(enterprise["id"])
                 payload = self.read_json()
                 transcript = str(payload.get("transcript", "")).strip()
                 frame = str(payload.get("frame", "")).strip()  # data:image/...;base64,
@@ -466,8 +473,30 @@ class Handler(BaseHTTPRequestHandler):
                 if not transcript and not frame:
                     self.send_json({"error": "transcript 不能为空"}, status=400)
                     return
-                reply = call_xiaowei(transcript, history, frame)
+                memory_context = build_call_memory_context(enterprise_id, load_messages(enterprise_id))
+                reply = call_xiaowei(transcript, history, frame, memory_context)
                 self.send_json({"ok": True, "reply": reply})
+                return
+            if self.path == "/api/voicecall/end":
+                # 挂断回流：把这通通话的对话清洗后并入主聊天时间线（channel:voice），
+                # 再触发画像更新——于是通话里说过的事，回到文字聊天小微也"记得"。
+                _user, enterprise = self.current_context()
+                enterprise_id = str(enterprise["id"])
+                payload = self.read_json()
+                turns = payload.get("transcript") if isinstance(payload.get("transcript"), list) else []
+                normalized, stats = normalize_transcript(turns)
+                voice_messages = []
+                for turn in normalized or []:
+                    role = "assistant" if turn.get("role") == "ai" else "user"
+                    content = str(turn.get("content") or turn.get("text") or "").strip()
+                    if content:
+                        voice_messages.append({"role": role, "content": content, "channel": "voice"})
+                auto_profile = None
+                if voice_messages:
+                    append_messages(enterprise_id, voice_messages)
+                    messages = load_messages(enterprise_id)
+                    auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
+                self.send_json({"ok": True, "saved": len(voice_messages), "auto_profile": auto_profile})
                 return
             if self.path == "/api/account/profile":
                 user, enterprise = self.current_context()

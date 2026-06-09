@@ -58,7 +58,35 @@ from config import (
     VOICECALL_RELAY_TOKEN,
     realtime_voice_ready,
 )
-from voicecall import REALTIME_INSTRUCTIONS, describe_frame, realtime_session_config
+from voicecall import (
+    REALTIME_INSTRUCTIONS,
+    describe_frame,
+    realtime_session_config,
+    verify_call_token,
+)
+
+
+async def _load_call_memory(enterprise_id: str) -> str:
+    """接通时构建一次"开场记忆"（画像+近期对话）。
+
+    与主聊天共享同一份记忆，让实时通话的小微一接通就认得这位客户。DB 读 + 画像
+    蒸馏丢线程池跑，避免阻塞事件循环；只在会话建立时跑一次，不在每轮音频环里，
+    故不影响实时延迟。任何异常都吞掉、返回空串（退化成无记忆通话，不拖垮通话）。
+    """
+    if not enterprise_id:
+        return ""
+    try:
+        from profile_service import build_call_memory_context
+        from enterprise import load_messages
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: build_call_memory_context(enterprise_id, load_messages(enterprise_id)),
+        )
+    except Exception as exc:
+        _dbg(f"记忆加载失败（退化为无记忆通话）：{exc!r}")
+        return ""
 
 
 # [DBG-vc] 临时诊断：把豆包事件号翻成可读名，定位"问我长什么样就卡住"。用完整体删除。
@@ -160,10 +188,11 @@ class _DoubaoBridge:
     **音频轮回复直接用上下文里的画面信息作答**（那条不吞、正常播）——不再特殊拦截，省得把好答案误吞。
     """
 
-    def __init__(self, browser: Any, upstream: Any, session_id: str) -> None:
+    def __init__(self, browser: Any, upstream: Any, session_id: str, enterprise_id: str = "") -> None:
         self.browser = browser
         self.upstream = upstream
         self.session_id = session_id
+        self.enterprise_id = enterprise_id  # 该通话所属企业（从令牌解出），用于注入共享记忆
         self.session_started = False
         self.ai_speaking = False
         self.suppress_until = 0.0
@@ -176,7 +205,10 @@ class _DoubaoBridge:
         self.user_turn_active = False
 
 
-_SUPPRESS_SECONDS = 8.0  # 吞画面播报的安全上限，防漏掉结束事件后一直静音
+_SUPPRESS_SECONDS = 3.0  # 吞画面播报的安全上限：够吞掉那条即时的画面复述即可。
+# 原为 8.0，但这是个"不分青红皂白"的静音窗——窗口内小微对用户的真实回复也会被一起吞掉，
+# 而看画面每 ~9-12s 触发一次、仅在用户开口(ASR)时才提前解除，用户安静时整段被吞→"突然不说话"。
+# 缩到 3s 大幅减少误伤；更精确的"按那条复述结束再解除"留作后续。
 # 静态场景也定期刷新画面事实：即便事实没变，超过这个间隔也重注一次，避免"无人/人数"被
 # 对话截断挤出小微的活跃上下文，导致用户口头注水时她手里没有反驳依据。
 _VISION_REFRESH_S = 12.0
@@ -314,8 +346,15 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
             await _flush_pending_vision(bridge)
 
         if frame.event == dbq.EVENT_CONNECTION_STARTED:
+            # 接通即注入"开场记忆"：把主聊天沉淀的客户档案+近期对话拼进人设，
+            # 让小微一接通就认得这位客户。只在这里跑一次，不进每轮音频环。
+            memory = await _load_call_memory(bridge.enterprise_id)
+            system_role = REALTIME_INSTRUCTIONS
+            if memory:
+                system_role = f"{REALTIME_INSTRUCTIONS}\n\n{memory}"
+                _dbg(f"注入开场记忆 {len(memory)} 字（enterprise={bridge.enterprise_id}）")
             session_cfg = dbq.build_session_config(
-                REALTIME_INSTRUCTIONS,
+                system_role,
                 tts_speaker=DOUBAO_REALTIME_TTS_SPEAKER,
                 model_version=DOUBAO_REALTIME_MODEL_VERSION,
                 end_smooth_window_ms=DOUBAO_REALTIME_END_WINDOW_MS,
@@ -364,7 +403,7 @@ async def _pump_doubao_browser(bridge: _DoubaoBridge) -> None:
         # input_audio_buffer.commit 等忽略：豆包走服务端 VAD 自动断句
 
 
-async def _handle_doubao(browser: Any) -> None:
+async def _handle_doubao(browser: Any, enterprise_id: str = "") -> None:
     """一个浏览器连接走豆包实时对话：开上游、握手、配会话、双向桥接。"""
     connect_id = str(uuid4())
     session_id = str(uuid4())
@@ -383,7 +422,7 @@ async def _handle_doubao(browser: Any) -> None:
         max_size=None,
     ) as upstream:
         await upstream.send(dbq.make_full_client_frame(dbq.EVENT_START_CONNECTION, {}, None))
-        bridge = _DoubaoBridge(browser, upstream, session_id)
+        bridge = _DoubaoBridge(browser, upstream, session_id, enterprise_id)
         up = asyncio.create_task(_pump_doubao_upstream(bridge))
         down = asyncio.create_task(_pump_doubao_browser(bridge))
         try:
@@ -478,14 +517,18 @@ async def _pump_step_browser(bridge: _StepBridge) -> None:
         await bridge.upstream.send(msg)
 
 
-async def _handle_stepfun(browser: Any) -> None:
+async def _handle_stepfun(browser: Any, enterprise_id: str = "") -> None:
     async with ws_connect(
         STEP_REALTIME_WSS,
         additional_headers={"Authorization": f"Bearer {STEP_API_KEY}"},
         proxy=None,
         max_size=None,
     ) as upstream:
-        await upstream.send(json.dumps({"type": "session.update", "session": realtime_session_config()}))
+        # 接通即注入与主聊天共享的"开场记忆"（只在建会话时一次，不进每轮音频环）。
+        memory = await _load_call_memory(enterprise_id)
+        if memory:
+            _dbg(f"注入开场记忆 {len(memory)} 字（enterprise={enterprise_id}）")
+        await upstream.send(json.dumps({"type": "session.update", "session": realtime_session_config(memory)}))
         bridge = _StepBridge(browser, upstream)
         up = asyncio.create_task(_pump_step_upstream(bridge))
         down = asyncio.create_task(_pump_step_browser(bridge))
@@ -497,14 +540,21 @@ async def _handle_stepfun(browser: Any) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 # 连接入口：校验 token → 按 provider 分流
 # ══════════════════════════════════════════════════════════════════════════
-def _token_ok(browser: Any) -> bool:
-    """校验连接 query 里的 ?token= 是否匹配（防公网盗用中继）。"""
+def _resolve_enterprise(browser: Any) -> str | None:
+    """校验连接 query 里的 ?token=，返回令牌里绑定的 enterprise_id；无效返回 None。
+
+    令牌由服务端 realtime-config 用 auth_secret 签发（绑定 enterprise_id+时效），
+    既防公网盗用中继、又让中继认得出是哪个企业在通话，据此注入该客户的共享记忆。
+    """
     try:
         path = browser.request.path  # 形如 /?token=xxx
     except Exception:
         path = ""
     token = (parse_qs(urlsplit(path).query).get("token") or [""])[0]
-    return secrets.compare_digest(token, VOICECALL_RELAY_TOKEN)
+    # 兼容老的全局静态令牌：校验通过则放行，但没有 enterprise 绑定→无记忆通话。
+    if VOICECALL_RELAY_TOKEN and secrets.compare_digest(token, VOICECALL_RELAY_TOKEN):
+        return ""
+    return verify_call_token(token)
 
 
 async def _handle_browser(browser: Any) -> None:
@@ -512,15 +562,16 @@ async def _handle_browser(browser: Any) -> None:
     if not realtime_voice_ready():
         await browser.close(code=1011, reason="realtime voice not configured")
         return
-    if not _token_ok(browser):
+    enterprise_id = _resolve_enterprise(browser)
+    if enterprise_id is None:
         await browser.close(code=4401, reason="unauthorized")
         return
-    _dbg("浏览器已连接，开始桥接")
+    _dbg(f"浏览器已连接，开始桥接（enterprise={enterprise_id or '—'}）")
     try:
         if VOICECALL_REALTIME_PROVIDER == "stepfun":
-            await _handle_stepfun(browser)
+            await _handle_stepfun(browser, enterprise_id)
         else:
-            await _handle_doubao(browser)
+            await _handle_doubao(browser, enterprise_id)
     except websockets.exceptions.WebSocketException as exc:
         _dbg(f"!! WebSocketException: {exc!r}")
         try:

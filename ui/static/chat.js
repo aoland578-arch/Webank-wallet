@@ -1787,7 +1787,11 @@ function applyChatStreamEvent(event) {
     const text = String(payload.text || "");
     if (text) {
       message.thinking = `${message.thinking || ""}${text}`;
-      if (isThinkingStatus(text)) {
+      // Only thinking.delta carries short status pings (e.g. "(⊙_⊙) deliberating...").
+      // reasoning.delta streams the model's chain-of-thought token-by-token; those
+      // tokens are short and newline-free, so they must NOT be shown as progress —
+      // otherwise the whole reasoning leaks into the live progress ticker.
+      if (event.type === "thinking.delta" && isThinkingStatus(text)) {
         appendUniqueProgress(message, { type: event.type, name: "Hermes", text });
       }
     }
@@ -2583,3 +2587,9 @@ syncResponsiveCopy();
 syncComposerTextState();
 renderMessages();
 bootstrapApp();
+
+// 视频通话挂断、对话已并入会话时，自动重新拉取消息渲染（无需手动刷新浏览器）。
+// voicecall.js 在 /api/voicecall/end 落库成功后派发此事件。
+document.addEventListener("voicecall:saved", () => {
+  loadMessages().catch(() => {});
+});

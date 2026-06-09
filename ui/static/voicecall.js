@@ -43,7 +43,37 @@
     active: false,
     engine: null, // 当前引擎实例（realtime 或 placeholder）
     stream: null, // 仅当 chat.js 没开摄像头时我们自己开的流
+    transcript: [], // 本通对话逐句累积（{role:"user"|"ai", text}）；挂断时回流并入主聊天记忆
   };
+
+  // 累一句到通话记录（挂断时 POST /api/voicecall/end 并入主聊天时间线+更新画像）。
+  function recordTurn(role, text) {
+    const t = String(text || "").trim();
+    if (t) call.transcript.push({ role, text: t });
+  }
+
+  // 挂断回流：把这通对话送回服务端清洗、存进主聊天时间线、触发画像更新。
+  // 用 keepalive 让请求在弹窗关闭/页面卸载后仍能发出；fire-and-forget。
+  function flushTranscript() {
+    const turns = call.transcript;
+    call.transcript = [];
+    if (!turns.length) return;
+    try {
+      fetch("/api/voicecall/end", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ transcript: turns }),
+        keepalive: true,
+      })
+        .then((r) => r.json())
+        .then((data) => {
+          // 通话已落库 → 通知聊天页重新拉取并渲染（chat.js 监听此事件调 loadMessages），
+          // 免得用户得手动刷新浏览器才看到这通对话。页面已关时此回调不触发，靠 keepalive 兜底落库。
+          if (data && data.saved) document.dispatchEvent(new CustomEvent("voicecall:saved"));
+        })
+        .catch(() => {});
+    } catch (e) {}
+  }
 
   function setStatus(text) {
     if (statusEl) statusEl.textContent = text;
@@ -194,6 +224,7 @@
     const sources = new Set(); // 已排期的播放节点，便于打断时停掉
     let selfCaption = ""; // 小微当前回复字幕累积（一段一段显示，整轮累积到一起）
     let gotSubtitle = false; // 本轮是否收到过 TTS 字幕事件（有就不用文本兜底，避免字幕翻倍）
+    let aiTurn = ""; // 小微本轮完整回复文本累积（用于挂断回流，独立于字幕显示）
     let lastAutoVision = 0; // 上次自动看画面的时间戳（节流）
     let visionBusy = false; // 一次看画面在途，避免叠发
     const AUTO_VISION_MIN_GAP_MS = 3000; // 每轮看一眼，但最快 3 秒一次
@@ -272,6 +303,7 @@
         case "response.audio_transcript.delta":
           gotSubtitle = true;
           selfCaption += ev.delta || "";
+          aiTurn += ev.delta || "";
           showCaption("小微：" + selfCaption);
           break;
         case "response.text.delta":
@@ -279,16 +311,19 @@
           // audio_transcript.delta；本轮若没收到字幕事件，就用文本当字幕显示。
           if (!gotSubtitle) {
             selfCaption += ev.delta || "";
+            aiTurn += ev.delta || "";
             showCaption("小微：" + selfCaption);
           }
           break;
         case "response.audio_transcript.done":
-          if (ev.transcript) showCaption("小微：" + ev.transcript);
+          if (ev.transcript) { showCaption("小微：" + ev.transcript); aiTurn = ev.transcript; }
           selfCaption = "";
           gotSubtitle = false;
           break;
         case "response.done":
-          // 一轮回复结束：清字幕累积，下一轮重新开始（豆包无 audio_transcript.done）。
+          // 一轮回复结束：记一句进通话记录，清字幕累积，下一轮重新开始（豆包无 audio_transcript.done）。
+          recordTurn("ai", aiTurn);
+          aiTurn = "";
           selfCaption = "";
           gotSubtitle = false;
           setCallState("listening");
@@ -296,7 +331,7 @@
           fadeCaptionSoon();
           break;
         case "conversation.item.input_audio_transcription.completed":
-          if (ev.transcript) setStatus("我：" + ev.transcript);
+          if (ev.transcript) { setStatus("我：" + ev.transcript); recordTurn("user", ev.transcript); }
           break;
         case "vision.described":
           // 每轮自动看画面是静默的：只复位单飞闸门，让下一轮可以再看；不打扰字幕/状态。
@@ -419,7 +454,7 @@
       });
     }
 
-    async function sendTurn(transcript) {
+    async function sendTurn(transcript, record = true) {
       if (state.sending) return;
       state.sending = true;
       setStatus("小微正在听...");
@@ -435,6 +470,8 @@
         const reply = String(data.reply || "").trim();
         state.history.push({ role: "user", content: transcript });
         state.history.push({ role: "assistant", content: reply });
+        if (record) { recordTurn("user", transcript); }
+        recordTurn("ai", reply);
         showCaption("小微：" + reply);
         state.speaking = true;
         pauseRecognition();
@@ -496,7 +533,7 @@
       await ensureStream();
       setStatus("通话已开始，请直接说话，小微在听...");
       setCallState("listening");
-      sendTurn("（通话刚接通，请用一句话热情地跟客户打招呼并自我介绍）");
+      sendTurn("（通话刚接通，请用一句话热情地跟客户打招呼并自我介绍）", false);
       startRecognition();
     }
 
@@ -539,6 +576,7 @@
   async function startCall() {
     if (call.active) return;
     call.active = true;
+    call.transcript = []; // 新通话，重置记录
     talkButton.textContent = "结束对话";
     if (muteButton) muteButton.disabled = false;
     showCaption("");
@@ -566,6 +604,7 @@
     setCallState(null);
     setOrbLevel(0);
     if (call.engine) { try { call.engine.stop(); } catch (e) {} call.engine = null; }
+    flushTranscript(); // 挂断回流：把本通对话并入主聊天记忆并触发画像更新
     // 只关我们自己开的流；chat.js 开的留给它管。
     if (call.stream) {
       call.stream.getTracks().forEach((t) => t.stop());

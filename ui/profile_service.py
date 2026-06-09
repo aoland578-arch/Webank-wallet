@@ -478,6 +478,63 @@ def profile_digest_for_prompt(
     return text[:max_chars].rstrip() + "\n…（画像较长，已截断）"
 
 
+def build_call_memory_context(
+    enterprise_id: str,
+    messages: list[dict[str, Any]] | None = None,
+    *,
+    tail_turns: int = 8,
+) -> str:
+    """构建视频/语音通话的"开场记忆"——让通话版小微一接通就认得这个客户。
+
+    主聊天与通话共享同一份长期记忆：企业风控画像（蒸馏）+ 最近几条对话 tail。
+    这段文字在**通话建立时一次性**注入通话人设，不在每轮音频环里跑，故不影响实时
+    延迟；为控住每轮 token 增量，画像只取风控相关章节、历史只取最近 tail_turns 条。
+
+    返回拼好的一段中文记忆；没有任何记忆时返回空串（调用方据此决定是否注入）。
+    """
+    if not enterprise_id:
+        return ""
+    parts: list[str] = []
+
+    # 只在画像**真正蒸馏过**时才注入画像段：企业一创建就落了一份空白模板，模板带章节
+    # 标题、会被 is_profile_document 当成"有效画像"，但字段全空、毫无客户事实。用 profile_state
+    # 里的 last_profile_updated_at 作权威信号——没生成过就跳过画像，避免给新客户灌一坨空表格。
+    profile_generated = bool(load_profile_state(enterprise_id).get("last_profile_updated_at"))
+    if profile_generated:
+        digest = profile_digest_for_prompt(enterprise_id)
+        if digest and not digest.startswith("（"):
+            parts.append(
+                "【此前文字沟通沉淀的档案（其中经营类型、店铺/场所、身份、金额、用途等"
+                "多为客户自述、尚未核实，别照念、更别当成已证实的事实）】\n" + digest
+            )
+
+    if messages:
+        tail = transcript_tail_for_prompt(messages, limit=tail_turns)
+        if tail and tail != "（暂无历史对话）":
+            parts.append(
+                "【最近的文字对话片段（含客户自报和你当时的随口回应；你的附和/客套"
+                "不代表那件事已坐实）】\n" + tail
+            )
+
+    if not parts:
+        return ""
+    # 反欺诈硬约束：记忆是"客户自报、未核实"的背景，绝不能凌驾于实时画面之上——否则
+    # 会把客户自己编的身份/场景洗成"可信记忆"，瓦解视频通话最关键的画面 vs 口述交叉核验
+    # （曾出现回归：注入记忆后，客户在宿舍谎称"在火锅店"，小微因记忆里记着他做餐饮而附和）。
+    return (
+        "（以下是系统在接通时给你的客户记忆，只给你看、绝不读出来或说「系统告诉我」，"
+        "自然地当成你本来就记得这位客户。但务必牢记：\n"
+        "① 记忆里关于客户的经营类型、店铺/场所、身份、金额、用途等，多是客户**自己口头声称、"
+        "尚未核实**的（不少已被标为存疑/待核验），它只帮你想起聊过什么、还差什么没核实，"
+        "**绝不是已证实的事实**。\n"
+        "② **实时画面永远优先于记忆**：当前摄像头看到的若与记忆里客户自报的场景/身份冲突，"
+        "**一律以当前画面为准**，当场用好奇、不指控的口吻核对，绝不能因为"
+        "「记忆里他说过开火锅店」就附和他此刻「我在火锅店」的说法。\n"
+        "③ 记忆里你之前的附和、客套，不代表那件事已坐实，别当成已确认的结论继续沿用。）\n\n"
+        + "\n\n".join(parts)
+    )
+
+
 def wallet_facts_block(enterprise_id: str) -> str:
     """实时流水汇总，作为"额度/收支是否匹配"验算的真实锚点。"""
     if not enterprise_id:

@@ -293,7 +293,11 @@ class HermesTuiGateway:
                 text = str(payload.get("text") or "")
                 if text:
                     thinking_parts.append(text)
-                    if is_thinking_status(text):
+                    # Only thinking.delta carries short status pings. reasoning.delta
+                    # streams the chain-of-thought token-by-token (each token is short
+                    # and newline-free), so it must not be surfaced as progress or the
+                    # whole reasoning leaks into the progress panel.
+                    if event_type == "thinking.delta" and is_thinking_status(text):
                         progress.append({"type": event_type, "text": text, "name": "Hermes"})
             elif event_type == "message.delta":
                 text = str(payload.get("text") or "")
