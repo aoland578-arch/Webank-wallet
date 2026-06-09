@@ -3645,15 +3645,11 @@ button {
 }
 
 .video-call-peer-avatar {
-  display: grid;
-  place-items: center;
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #2f80ed, #00a6b4);
-  font-size: 17px;
-  font-weight: 600;
-  color: #fff;
+  object-fit: cover;
+  background: linear-gradient(135deg, #2f80ed, #00a6b4); /* 图片加载前的占位底色 */
   flex: none;
 }
 

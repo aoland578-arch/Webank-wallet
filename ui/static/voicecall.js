@@ -192,7 +192,7 @@
     let levelRAF = 0; // requestAnimationFrame 句柄
     let nextPlayTime = 0; // 播放调度游标
     const sources = new Set(); // 已排期的播放节点，便于打断时停掉
-    let selfCaption = ""; // 小微当前句子字幕累积
+    let selfCaption = ""; // 小微当前回复字幕累积（一段一段显示，整轮累积到一起）
     let gotSubtitle = false; // 本轮是否收到过 TTS 字幕事件（有就不用文本兜底，避免字幕翻倍）
     let lastAutoVision = 0; // 上次自动看画面的时间戳（节流）
     let visionBusy = false; // 一次看画面在途，避免叠发
