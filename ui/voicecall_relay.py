@@ -27,10 +27,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import secrets
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
@@ -69,6 +71,36 @@ from voicecall import (
 import video_calls
 
 
+# 中继的阻塞调用（看画面 describe_frame ~5s、矛盾比对、开场记忆加载）统一走这个
+# 专用线程池——asyncio 默认线程池是全进程共享的 min(32, cpu+4) 个线程，几十路
+# 通话同时截帧会把它挤爆，连带拖慢所有借道默认池的任务。
+_RELAY_EXECUTOR = ThreadPoolExecutor(
+    max_workers=int(os.environ.get("WEWALLET_RELAY_WORKERS", "16")),
+    thread_name_prefix="vc-worker",
+)
+
+# 并发通话上限：每路通话占 1 条上游实时语音会话（按时计费）+ 持续的视觉/比对调用。
+# 不设上限，拿到合法 token 的客户端开 N 个标签页就能把上游费用和本机线程打爆。
+MAX_CONCURRENT_CALLS = int(os.environ.get("WEWALLET_MAX_CALLS", "20"))
+_active_calls = 0
+_calls_lock = threading.Lock()
+
+
+def _acquire_call_slot() -> bool:
+    global _active_calls
+    with _calls_lock:
+        if _active_calls >= MAX_CONCURRENT_CALLS:
+            return False
+        _active_calls += 1
+        return True
+
+
+def _release_call_slot() -> None:
+    global _active_calls
+    with _calls_lock:
+        _active_calls = max(0, _active_calls - 1)
+
+
 async def _load_call_memory(enterprise_id: str) -> str:
     """接通时构建一次"开场记忆"（画像+近期对话）。
 
@@ -84,7 +116,7 @@ async def _load_call_memory(enterprise_id: str) -> str:
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None,
+            _RELAY_EXECUTOR,
             lambda: build_call_memory_context(enterprise_id, load_messages(enterprise_id)),
         )
     except Exception as exc:
@@ -310,7 +342,7 @@ async def _inject_vision_doubao(bridge: _DoubaoBridge, frame: str) -> None:
     """
     loop = asyncio.get_running_loop()
     _t0 = time.monotonic()
-    result = await loop.run_in_executor(None, describe_frame, frame)  # 阻塞 requests，丢线程池
+    result = await loop.run_in_executor(_RELAY_EXECUTOR, describe_frame, frame)  # 阻塞 requests，丢线程池
     caption = str(result.get("caption") or "看不清。")
     observation = result.get("observation")
     _dbg(f"VISION describe_frame 耗时 {time.monotonic()-_t0:.1f}s caption={caption[:40]!r} obs={observation}")
@@ -372,7 +404,7 @@ async def _contradiction_task_doubao(bridge: _DoubaoBridge, utterance: str) -> N
         loop = asyncio.get_running_loop()
         recent = "\n".join(f"{role}：{text}" for role, text in bridge.recent_turns[-6:])
         items = await loop.run_in_executor(
-            None, check_contradictions, bridge.memory_text, utterance, recent)
+            _RELAY_EXECUTOR, check_contradictions, bridge.memory_text, utterance, recent)
         for item in items:
             key = f"{item.get('field', '')}|{item.get('known', '')}"
             if key in bridge.contradiction_keys:
@@ -624,7 +656,7 @@ async def _inject_vision_step(bridge: _StepBridge, frame: str) -> None:
     核验提示（_verify_hint）本就是"只给她自己看、适时自然去做"的内部指引，一并折进静默注入。
     """
     loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, describe_frame, frame)
+    result = await loop.run_in_executor(_RELAY_EXECUTOR, describe_frame, frame)
     caption = str(result.get("caption") or "看不清。")
     observation = result.get("observation")
     try:
@@ -734,6 +766,11 @@ async def _handle_browser(browser: Any) -> None:
     if enterprise_id is None:
         await browser.close(code=4401, reason="unauthorized")
         return
+    if not _acquire_call_slot():
+        # 1013 = Try Again Later。满了直接拒接，别让上游会话数/费用无界增长。
+        _dbg(f"通话槽位已满（{MAX_CONCURRENT_CALLS}），拒接 enterprise={enterprise_id or '—'}")
+        await browser.close(code=1013, reason="too many concurrent calls")
+        return
     _dbg(f"浏览器已连接，开始桥接（enterprise={enterprise_id or '—'}）")
     try:
         if VOICECALL_REALTIME_PROVIDER == "stepfun":
@@ -754,6 +791,7 @@ async def _handle_browser(browser: Any) -> None:
         except Exception:
             pass
     finally:
+        _release_call_slot()
         _dbg("桥接结束，连接收尾")
 
 

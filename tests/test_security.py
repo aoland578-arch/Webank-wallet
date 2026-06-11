@@ -64,9 +64,76 @@ class BucketRoutingTestCase(unittest.TestCase):
     def test_other_auth_bucket(self) -> None:
         self.assertEqual(security.bucket_for_path("/api/auth/logout"), "auth_other")
 
-    def test_non_auth_path_unbucketed(self) -> None:
-        self.assertIsNone(security.bucket_for_path("/api/chat"))
+    def test_chat_bucket(self) -> None:
+        self.assertEqual(security.bucket_for_path("/api/chat"), "chat")
+        self.assertEqual(security.bucket_for_path("/api/chat/stream"), "chat")
+
+    def test_voicecall_bucket(self) -> None:
+        self.assertEqual(security.bucket_for_path("/api/voicecall"), "voicecall")
+        self.assertEqual(security.bucket_for_path("/api/voicecall/end"), "voicecall")
+
+    def test_reindex_bucket(self) -> None:
+        self.assertEqual(security.bucket_for_path("/api/knowledge/reindex"), "reindex")
+        self.assertEqual(security.bucket_for_path("/api/image-knowledge/reindex"), "reindex")
+
+    def test_heavy_bucket(self) -> None:
+        self.assertEqual(security.bucket_for_path("/api/loan/estimate"), "heavy")
+        self.assertEqual(security.bucket_for_path("/api/profile/refresh"), "heavy")
+
+    def test_cheap_path_unbucketed(self) -> None:
         self.assertIsNone(security.bucket_for_path("/api/profile"))
+        self.assertIsNone(security.bucket_for_path("/api/messages/suggestions"))
+
+
+class ResolveClientIpTestCase(unittest.TestCase):
+    """XFF 只有在直连对端是受信代理（默认 loopback）时才生效。"""
+
+    def setUp(self) -> None:
+        self._original = list(security.TRUSTED_PROXY_NETS)
+        security.set_trusted_proxies("127.0.0.1,::1")
+
+    def tearDown(self) -> None:
+        security.TRUSTED_PROXY_NETS.clear()
+        security.TRUSTED_PROXY_NETS.extend(self._original)
+
+    def test_direct_connection_ignores_xff(self) -> None:
+        # 直连客户端伪造 XFF 不能换身份绕限流。
+        self.assertEqual(
+            security.resolve_client_ip("9.9.9.9", "1.2.3.4"), "9.9.9.9"
+        )
+
+    def test_trusted_proxy_uses_xff(self) -> None:
+        self.assertEqual(
+            security.resolve_client_ip("127.0.0.1", "1.2.3.4"), "1.2.3.4"
+        )
+
+    def test_walks_chain_right_to_left_skipping_trusted(self) -> None:
+        # 最右非受信跳是 nginx 看到的真实对端；更左的是客户端可伪造的。
+        self.assertEqual(
+            security.resolve_client_ip("127.0.0.1", "6.6.6.6, 1.2.3.4, 127.0.0.1"),
+            "1.2.3.4",
+        )
+
+    def test_all_trusted_chain_falls_back_to_remote(self) -> None:
+        self.assertEqual(
+            security.resolve_client_ip("127.0.0.1", "127.0.0.1, ::1"), "127.0.0.1"
+        )
+
+    def test_no_xff_returns_remote(self) -> None:
+        self.assertEqual(security.resolve_client_ip("127.0.0.1", ""), "127.0.0.1")
+
+    def test_cidr_trusted_proxy(self) -> None:
+        # Docker compose 里 nginx 容器的对端是 172.x 网段。
+        security.set_trusted_proxies("127.0.0.1,172.16.0.0/12")
+        self.assertEqual(
+            security.resolve_client_ip("172.18.0.3", "1.2.3.4"), "1.2.3.4"
+        )
+
+    def test_garbage_xff_hop_treated_as_untrusted(self) -> None:
+        # 非法 IP 串当不受信处理（用作限流键也安全，只是不可伪造成受信跳）。
+        self.assertEqual(
+            security.resolve_client_ip("127.0.0.1", "not-an-ip"), "not-an-ip"
+        )
 
 
 class CsrfTestCase(unittest.TestCase):

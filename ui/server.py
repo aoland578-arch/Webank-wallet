@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sys
 import time
 import traceback
@@ -60,8 +61,8 @@ from enterprise import (
     replace_messages,
     save_account_profile,
 )
-from gateway import gateway_for_enterprise, start_gateway_sweeper
-from security import bucket_for_path, check_csrf, check_rate_limit
+from gateway import GatewayPoolBusy, gateway_for_enterprise, start_gateway_sweeper
+from security import bucket_for_path, check_csrf, check_rate_limit, resolve_client_ip
 from profile_service import (
     KNOWLEDGE,
     KNOWLEDGE_TOP_K,
@@ -113,6 +114,29 @@ import threading
 
 
 EmitFn = Callable[[str, dict[str, Any]], None]
+
+# 全局并发请求闸：ThreadingHTTPServer 每连接一线程且无上限，而一轮聊天最长占线程
+# 300s——不设闸，高并发或慢连接会无限堆线程直到 FD/内存耗尽。满了立刻 503 让客户端
+# 重试，比排队挂死强。/healthz 绕过：过载时探活也得通，否则编排误判把服务重启。
+MAX_CONCURRENT_REQUESTS = int(os.environ.get("WEWALLET_MAX_CONCURRENT_REQUESTS", "100"))
+_REQUEST_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_REQUESTS)
+BUSY_MESSAGE = "服务繁忙，请稍后再试"
+
+# 重建索引（全量 embedding）单飞锁：限流挡频率，这里挡并发——多个重建同时跑
+# 既烧 embedding 费用又互相踩 SQLite。文本知识库是全局一份，全局一把锁；
+# 图片库按企业隔离，按企业一把。
+_KNOWLEDGE_REINDEX_LOCK = threading.Lock()
+_IMAGE_REINDEX_LOCKS: dict[str, threading.Lock] = {}
+_IMAGE_REINDEX_GUARD = threading.Lock()
+
+
+def _image_reindex_lock(enterprise_id: str) -> threading.Lock:
+    with _IMAGE_REINDEX_GUARD:
+        lock = _IMAGE_REINDEX_LOCKS.get(enterprise_id)
+        if lock is None:
+            lock = threading.Lock()
+            _IMAGE_REINDEX_LOCKS[enterprise_id] = lock
+        return lock
 
 
 def _asr_progress_events(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -259,8 +283,35 @@ def run_chat_turn(
         for ev in asr_events:
             emit(ev["type"], {"name": ev.get("name"), "tool_id": ev.get("tool_id"), "preview": ev.get("text")})
 
+    # 知识库与图片 KB 检索并行：两者各自要一次 embedding 网络调用（数百 ms），
+    # 串行就是白白叠加的首字延迟。图片 KB 丢后台线程，知识库在请求线程内联跑，
+    # 然后 join——emit 只发生在请求线程（wfile 非线程安全）。
     if emit:
         emit("tool.start", {"name": "本地知识库", "tool_id": "local-knowledge"})
+        emit("tool.start", {"name": "客户历史图档", "tool_id": "image-history"})
+
+    image_kb = image_kb_for_enterprise(enterprise_id)
+    image_result: dict[str, Any] = {}
+
+    def _image_search_worker() -> None:
+        started = time.monotonic()
+        try:
+            image_result["hits"] = image_kb.search(
+                text=display_message,
+                image_paths=image_paths,
+                top_k=IMAGE_KB_TOP_K,
+                exclude_paths=image_paths,
+            )
+        except Exception as exc:
+            image_result["error"] = exc
+        finally:
+            image_result["duration"] = time.monotonic() - started
+
+    image_thread = threading.Thread(
+        target=_image_search_worker, name=f"image-search-{enterprise_id}", daemon=True
+    )
+    image_thread.start()
+
     knowledge_started_at = time.monotonic()
     try:
         knowledge_hits = KNOWLEDGE.search(display_message, top_k=KNOWLEDGE_TOP_K)
@@ -283,29 +334,24 @@ def run_chat_turn(
         })
     local_progress = asr_events + knowledge_progress_events(knowledge_hits, knowledge_duration)
 
-    image_kb = image_kb_for_enterprise(enterprise_id)
-    if emit:
-        emit("tool.start", {"name": "客户历史图档", "tool_id": "image-history"})
-    image_kb_started_at = time.monotonic()
-    try:
-        image_hits = image_kb.search(
-            text=display_message,
-            image_paths=image_paths,
-            top_k=IMAGE_KB_TOP_K,
-            exclude_paths=image_paths,
-        )
-    except Exception as exc:
-        # 图档检索失败不致命：跳过图档继续走纯文本/知识库流程。
-        image_hits = []
+    # 图档检索失败/超时不致命：跳过图档继续走纯文本/知识库流程。
+    # join 设上限防网络挂死拖住整轮（daemon 线程超时后自生自灭）。
+    image_thread.join(timeout=30.0)
+    image_hits = image_result.get("hits") or []
+    image_error = image_result.get("error")
+    if image_thread.is_alive():
+        image_error = TimeoutError("图档检索超时")
+    image_kb_duration = float(image_result.get("duration") or 30.0)
+    if image_error is not None:
         if emit:
             emit("tool.complete", {
                 "name": "客户历史图档",
                 "tool_id": "image-history",
-                "duration_s": time.monotonic() - image_kb_started_at,
-                "error": str(exc),
+                "duration_s": image_kb_duration,
+                "error": str(image_error),
             })
+        image_hits = []
     else:
-        image_kb_duration = time.monotonic() - image_kb_started_at
         if emit:
             emit("tool.progress", {"name": "客户历史图档", "preview": summarize_image_hits(image_hits)})
             emit("tool.complete", {
@@ -517,8 +563,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
+        path = unquote(self.path.split("?", 1)[0])
+        if path == "/healthz":
+            self.get_healthz(None, None)
+            return
+        if not _REQUEST_SLOTS.acquire(blocking=False):
+            self.send_json({"error": BUSY_MESSAGE}, status=503)
+            return
         try:
-            path = unquote(self.path.split("?", 1)[0])
             if path in ("", "/", "/chat"):
                 self.send_chat_page()
                 return
@@ -535,12 +587,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc), "needs_enterprise": True}, status=403)
         except AuthError as exc:
             self.send_json({"error": str(exc), "authenticated": False}, status=401)
+        except GatewayPoolBusy as exc:
+            self.send_json({"error": str(exc)}, status=503)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, status=400)
         except Exception as exc:
             self.send_internal_error(exc)
+        finally:
+            _REQUEST_SLOTS.release()
 
     def do_POST(self) -> None:
+        if not _REQUEST_SLOTS.acquire(blocking=False):
+            self.send_json({"error": BUSY_MESSAGE}, status=503)
+            return
         try:
             if not check_csrf(
                 self.headers.get("Origin", ""),
@@ -551,7 +610,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             bucket = bucket_for_path(self.path)
             if bucket:
-                client_ip = self.client_address[0] if self.client_address else ""
+                # 反代部署时直连地址是 nginx，必须解析 X-Forwarded-For 才能按真实
+                # 客户端限流；直连时不信任 XFF（可伪造）。见 security.resolve_client_ip。
+                client_ip = resolve_client_ip(
+                    self.client_address[0] if self.client_address else "",
+                    self.headers.get("X-Forwarded-For", ""),
+                )
                 if not check_rate_limit(client_ip, bucket):
                     self.send_json({"error": "请求过于频繁，请稍后再试"}, status=429)
                     return
@@ -565,11 +629,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc), "needs_enterprise": True}, status=403)
         except AuthError as exc:
             self.send_json({"error": str(exc), "authenticated": False}, status=401)
+        except GatewayPoolBusy as exc:
+            self.send_json({"error": str(exc)}, status=503)
         except ValueError as exc:
             # ValueError 携带的是面向用户的中文提示（手机号格式、上传过大等）。
             self.send_json({"error": str(exc)}, status=400)
         except Exception as exc:
             self.send_internal_error(exc)
+        finally:
+            _REQUEST_SLOTS.release()
 
     INTERNAL_ERROR_MESSAGE = "服务器开小差了，请稍后再试"
 
@@ -843,7 +911,7 @@ class Handler(BaseHTTPRequestHandler):
             emit("assistant.start", {"content": "正在分析客户需求..."})
             result = run_chat_turn(enterprise_id, enterprise, user_message, attachments, emit=emit)
             emit("message.complete", result)
-        except ValueError as exc:
+        except (ValueError, GatewayPoolBusy) as exc:
             emit("error", {"error": str(exc)})
         except Exception as exc:
             self.log_exception(exc)
@@ -921,15 +989,28 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── POST handlers：知识库 / 画像 ──────────────────────────────────────
     def post_knowledge_reindex(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
-        self.send_json(KNOWLEDGE.rebuild())
+        if not _KNOWLEDGE_REINDEX_LOCK.acquire(blocking=False):
+            self.send_json({"error": "知识库正在重建中，请稍后再试"}, status=409)
+            return
+        try:
+            self.send_json(KNOWLEDGE.rebuild())
+        finally:
+            _KNOWLEDGE_REINDEX_LOCK.release()
 
     def post_image_knowledge_reindex(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         enterprise_id = str(enterprise["id"])
-        self.send_json(
-            image_kb_for_enterprise(enterprise_id).rebuild_from_uploads(
-                enterprise_uploads_dir(enterprise_id)
+        lock = _image_reindex_lock(enterprise_id)
+        if not lock.acquire(blocking=False):
+            self.send_json({"error": "图片库正在重建中，请稍后再试"}, status=409)
+            return
+        try:
+            self.send_json(
+                image_kb_for_enterprise(enterprise_id).rebuild_from_uploads(
+                    enterprise_uploads_dir(enterprise_id)
+                )
             )
-        )
+        finally:
+            lock.release()
 
     def post_loan_estimate(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         estimate = run_loan_estimate(str(enterprise["id"]), enterprise)
@@ -1160,16 +1241,22 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_file(self, path: Path, content_type: str) -> None:
+        # 流式分块发送：原先 read_bytes() 把整个文件（上传材料最大 25MB、聊天里的
+        # 音视频）读进内存再发，100 个并发下载就是 GB 级瞬时内存。64KB 一块即发即弃。
         if not path.exists() or not path.is_file():
             self.send_error(404)
             return
-        body = path.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            with path.open("rb") as fp:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.end_headers()
+                shutil.copyfileobj(fp, self.wfile, length=64 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端中途断开（关页面/切网）是常态，不算服务端错误。
+            pass
 
     @staticmethod
     def content_type(path: Path) -> str:

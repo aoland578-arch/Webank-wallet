@@ -29,6 +29,15 @@ GATEWAY_LOCK = threading.RLock()
 GATEWAYS: dict[str, "HermesTuiGateway"] = {}
 PROFILE_UPDATE_LOCKS: dict[str, threading.Lock] = {}
 
+# 活跃网关子进程上限：每企业一个 Hermes agent 子进程（每个上百 MB），不设上限
+# 100 个企业并发就是 100+ 个进程、内存直接打爆。满了先驱逐"最久未用且空闲"的；
+# 全都在忙则快速失败（上层映射 503），不排队拖死请求线程。
+MAX_ACTIVE_GATEWAYS = int(os.environ.get("WEWALLET_MAX_GATEWAYS", "20"))
+
+
+class GatewayPoolBusy(RuntimeError):
+    """所有网关槽位都在处理请求：让上层返回 503，而不是无限拉新进程。"""
+
 
 def split_reasoning(text: str) -> tuple[str, str]:
     visible = text or ""
@@ -114,8 +123,20 @@ class HermesTuiGateway:
         self._pending: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._events: dict[str, queue.Queue[dict[str, Any]]] = {}
         self._sessions: dict[str, str] = {}
+        # 每个会话一把"轮次锁"：同一企业并发双发消息时，两个线程会同时消费同一个
+        # 事件队列（_collect_turn），互相抢事件、回复串台。锁住整轮（drain→submit→
+        # collect），第二个请求快速失败而不是排队 300s 占着线程。
+        self._turn_locks: dict[str, threading.Lock] = {}
         self._stderr_tail: list[str] = []
         self._last_used_at = time.monotonic()
+
+    def _turn_lock(self, session_name: str) -> threading.Lock:
+        with self._lock:
+            lock = self._turn_locks.get(session_name)
+            if lock is None:
+                lock = threading.Lock()
+                self._turn_locks[session_name] = lock
+            return lock
 
     def submit(
         self,
@@ -126,22 +147,36 @@ class HermesTuiGateway:
         event_callback: Any = None,
         timeout: float = GATEWAY_TURN_TIMEOUT,
     ) -> dict[str, Any]:
-        self._last_used_at = time.monotonic()
-        sid = self._ensure_session(session_name)
-        self._drain_events(sid)
-        for image_path in image_paths or []:
-            try:
-                self._request("image.attach", {"session_id": sid, "path": image_path}, timeout=10.0)
-            except Exception:
-                # Keep the chat turn usable even if this gateway build rejects
-                # native image attachment for a saved upload.
-                pass
-        self._request("prompt.submit", {"session_id": sid, "text": prompt})
-        return self._collect_turn(sid, event_callback=event_callback, timeout=timeout)
+        turn_lock = self._turn_lock(session_name)
+        # 短超时快速失败：上一轮还在跑就直接告知用户，别让第二个请求线程
+        # 阻塞最长 300s（ValueError 在 server.py 映射为 400 + 中文提示）。
+        if not turn_lock.acquire(timeout=1.0):
+            raise ValueError("上一条消息还在处理中，请等小微回复后再发")
+        try:
+            self._last_used_at = time.monotonic()
+            sid = self._ensure_session(session_name)
+            self._drain_events(sid)
+            for image_path in image_paths or []:
+                try:
+                    self._request("image.attach", {"session_id": sid, "path": image_path}, timeout=10.0)
+                except Exception:
+                    # Keep the chat turn usable even if this gateway build rejects
+                    # native image attachment for a saved upload.
+                    pass
+            self._request("prompt.submit", {"session_id": sid, "text": prompt})
+            return self._collect_turn(sid, event_callback=event_callback, timeout=timeout)
+        finally:
+            # 整轮（可长达数分钟）结束才算"刚用过"，空闲回收据此计时。
+            self._last_used_at = time.monotonic()
+            turn_lock.release()
 
     def reset_session(self, session_name: str) -> None:
         with self._lock:
             sid = self._sessions.pop(session_name, None)
+            # 一次性会话（如贷款试算 loan:{id}:{ns}）的轮次锁用完即弃，否则慢性累积。
+            lock = self._turn_locks.get(session_name)
+            if lock is not None and not lock.locked():
+                self._turn_locks.pop(session_name, None)
         if sid:
             try:
                 self._request("session.close", {"session_id": sid}, timeout=5.0)
@@ -385,9 +420,16 @@ class HermesTuiGateway:
         return f"{message}\n{tail}" if tail else message
 
     def is_idle(self, threshold_seconds: float) -> bool:
-        if self._pending:
+        if self.is_busy():
             return False
         return (time.monotonic() - self._last_used_at) > threshold_seconds
+
+    def is_busy(self) -> bool:
+        """有在途请求或在途轮次（轮次锁被持有）即视为忙，忙的网关不可驱逐。"""
+        if self._pending:
+            return True
+        with self._lock:
+            return any(lock.locked() for lock in self._turn_locks.values())
 
     def shutdown(self) -> None:
         with self._lock:
@@ -423,12 +465,30 @@ def gateway_for_enterprise(enterprise_id: str, slot: str = "") -> HermesTuiGatew
     """
     home = ensure_enterprise_hermes_home(enterprise_id)
     key = enterprise_id if not slot else f"{enterprise_id}#{slot}"
-    with GATEWAY_LOCK:
-        gateway = GATEWAYS.get(key)
-        if gateway is None:
-            gateway = HermesTuiGateway(home, enterprise_id=enterprise_id)
-            GATEWAYS[key] = gateway
-        return gateway
+    evicted: list[HermesTuiGateway] = []
+    try:
+        with GATEWAY_LOCK:
+            gateway = GATEWAYS.get(key)
+            if gateway is None:
+                # 池满先驱逐最久未用且空闲的（会话上下文会丢，但每轮 prompt 都带
+                # 完整消息历史重建，效果等同既有的 idle sweep）；全忙则快速失败。
+                while len(GATEWAYS) >= MAX_ACTIVE_GATEWAYS:
+                    evict_key = min(
+                        (k for k, g in GATEWAYS.items() if not g.is_busy()),
+                        key=lambda k: GATEWAYS[k]._last_used_at,
+                        default=None,
+                    )
+                    if evict_key is None:
+                        raise GatewayPoolBusy("当前咨询人数较多，请稍后再试")
+                    evicted.append(GATEWAYS.pop(evict_key))
+                gateway = HermesTuiGateway(home, enterprise_id=enterprise_id)
+                GATEWAYS[key] = gateway
+            return gateway
+    finally:
+        # shutdown 可能要等子进程退出（最长 5s），放到锁外的后台线程做，
+        # 不阻塞当前聊天请求、也不长时间占着 GATEWAY_LOCK。
+        for old in evicted:
+            threading.Thread(target=old.shutdown, name="gateway-evict", daemon=True).start()
 
 
 def profile_update_lock(enterprise_id: str) -> threading.Lock:
