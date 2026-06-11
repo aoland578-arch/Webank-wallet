@@ -49,3 +49,6 @@ output/
 deploy/certs/*.pem
 deploy/certs/*.crt
 deploy/certs/*.key
+
+# 报告/宣传临时产物（生成脚本与渲染输出，不入库）
+tmp/
