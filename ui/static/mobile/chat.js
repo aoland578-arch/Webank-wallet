@@ -83,7 +83,9 @@ const registerForm = document.getElementById("registerForm");
 const enterpriseForm = document.getElementById("enterpriseForm");
 const loginPhone = document.getElementById("loginPhone");
 const loginPassword = document.getElementById("loginPassword");
+const toggleLoginPassword = document.getElementById("toggleLoginPassword");
 const loginCode = document.getElementById("loginCode");
+const authSubmitButton = loginForm.querySelector(".auth-submit");
 const loginPasswordField = document.getElementById("loginPasswordField");
 const loginSmsField = document.getElementById("loginSmsField");
 const passwordLoginTab = document.getElementById("passwordLoginTab");
@@ -303,7 +305,7 @@ function appendProgress(container, progress, streaming = false) {
   summary.className = "proc-summary";
   summary.innerHTML =
     `<span class="proc-chevron"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>` +
-    `<span class="proc-title">小微的思考</span>` +
+    `<span class="proc-title">思考</span>` +
     `<span class="proc-badge">${steps.length} 步</span>` +
     `<span class="proc-last">${escapeHtml(lastLabel)}</span>`;
 
@@ -706,7 +708,18 @@ function setLoginMode(mode) {
   loginSmsField.hidden = !smsMode;
   passwordLoginTab.classList.toggle("is-active", !smsMode);
   smsLoginTab.classList.toggle("is-active", smsMode);
+  passwordLoginTab.setAttribute("aria-selected", String(!smsMode));
+  smsLoginTab.setAttribute("aria-selected", String(smsMode));
+  syncAuthSubmitState();
   showAuthMessage("");
+}
+
+function syncAuthSubmitState() {
+  const hasPhone = Boolean(loginPhone.value.trim());
+  const hasCredential = state.loginMode === "sms"
+    ? Boolean(loginCode.value.trim())
+    : Boolean(loginPassword.value);
+  authSubmitButton.classList.toggle("has-input", hasPhone || hasCredential);
 }
 
 function showRegister(show) {
@@ -1349,6 +1362,10 @@ messageInput.addEventListener("input", () => {
   syncComposerTextState();
 });
 
+loginPhone.addEventListener("input", syncAuthSubmitState);
+loginPassword.addEventListener("input", syncAuthSubmitState);
+loginCode.addEventListener("input", syncAuthSubmitState);
+
 async function sendAuthCode(phone, targetInput, button) {
   showAuthMessage("");
   button.disabled = true;
@@ -1415,6 +1432,12 @@ registerForm.addEventListener("submit", async (event) => {
 
 passwordLoginTab.onclick = () => setLoginMode("password");
 smsLoginTab.onclick = () => setLoginMode("sms");
+toggleLoginPassword.onclick = () => {
+  const showPassword = loginPassword.type === "password";
+  loginPassword.type = showPassword ? "text" : "password";
+  toggleLoginPassword.textContent = showPassword ? "隐藏" : "显示";
+  toggleLoginPassword.setAttribute("aria-label", showPassword ? "隐藏密码" : "显示密码");
+};
 openRegisterButton.onclick = () => showRegister(true);
 backToLoginButton.onclick = () => showRegister(false);
 

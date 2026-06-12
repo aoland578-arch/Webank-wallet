@@ -65,6 +65,7 @@ from voicecall import (
     REALTIME_INSTRUCTIONS,
     check_contradictions,
     describe_frame,
+    read_document,
     realtime_session_config,
     verify_call_token,
 )
@@ -211,6 +212,111 @@ def _verify_hint(observation: dict[str, Any] | None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# 二段式证件识读（方案 B）：第一段低清观察发现证件 / 客户口头预告出示 → 让前端
+# 回传一帧 1280 宽高清图（vision.request_hires / vision.hires_frame）→ 专用 OCR
+# prompt 读字（voicecall.read_document）→ 识读结果以核验提示静默注入实时会话，
+# 接上已有的"请客户口头念出、互相核对"流程。两个 provider 桥共用这套辅助。
+# ══════════════════════════════════════════════════════════════════════════
+_HIRES_MIN_GAP_S = 12.0  # 两次高清识读请求的最小间隔：证件举着不动时别反复烧 OCR
+
+# 客户口头预告出示材料（"我给你看下执照"）的关键词：名词+动词都命中才算，
+# 单独说到"执照"（如聊办照经过）不触发。
+_DOC_WORD_RE = re.compile(r"身份证|营业执照|执照|证件|银行卡|流水|合同|发票|单据")
+_SHOW_VERB_RE = re.compile(r"看|出示|举|拿|给您|给你|展示|亮")
+
+
+def _wants_to_show_document(utterance: str) -> bool:
+    text = (utterance or "").strip()
+    return bool(text and _DOC_WORD_RE.search(text) and _SHOW_VERB_RE.search(text))
+
+
+async def _request_hires_frame(bridge: Any, delay_s: float = 0.0) -> None:
+    """让前端回传一帧高清画面做证件识读（节流 + 单飞，绝不抛错）。
+
+    delay_s 用于"口头预告出示"的场景：客户刚说"我给你看下执照"，证件还没举起来，
+    等一两秒再截，截到的才是证件而不是他低头翻包。
+    """
+    if bridge.ocr_in_flight:
+        return
+    now = time.monotonic()
+    if now - bridge.last_hires_req_at < _HIRES_MIN_GAP_S:
+        return
+    bridge.last_hires_req_at = now
+    if delay_s > 0:
+        await asyncio.sleep(delay_s)
+    try:
+        await bridge.browser.send(json.dumps({"type": "vision.request_hires"}))
+        _dbg("OCR 请求前端回传高清帧")
+    except Exception:
+        pass
+
+
+def _doc_fingerprint(reading: dict[str, Any]) -> str:
+    """同一证件同一读数的指纹：整通内重复识读不重复注入，别刷小微的上下文。"""
+    fields = reading.get("fields") or {}
+    return str(reading.get("document_type") or "") + "|" + \
+        "|".join(f"{k}={v}" for k, v in sorted(fields.items()))
+
+
+def _doc_summary(reading: dict[str, Any]) -> str:
+    """给前端经办人看的一行识读摘要。"""
+    doc_type = str(reading.get("document_type") or "证件")
+    fields = reading.get("fields") or {}
+    body = "；".join(f"{k}：{v}" for k, v in list(fields.items())[:8])
+    if body:
+        return f"{doc_type}——{body}"
+    note = str(reading.get("note") or "").strip()
+    return f"{doc_type}——关键字段没读清" + (f"（{note}）" if note else "")
+
+
+def _doc_hint(reading: dict[str, Any]) -> str:
+    """把识读结果折成给小微的静默核验提示（绝不读出来），接"请对方口头念出核对"流程。"""
+    doc_type = str(reading.get("document_type") or "证件")
+    fields = reading.get("fields") or {}
+    if fields:
+        body = "；".join(f"{k}：{v}" for k, v in list(fields.items())[:8])
+        return (
+            "（核验提示·证件识读，仅你自己看、绝不要读出来也绝不主动复述全文：你刚通过镜头"
+            f"看清了对方出示的【{doc_type}】，上面读到——{body}。请让对方【口头念出】其中的"
+            "关键信息（姓名/企业名/证号/日期等），拿他念的和你看到的逐项核对；他念的与你看到的"
+            "对不上、或与已知档案口径对不上，温和但当场点出，绝不装没看见。号码里带？的字符"
+            "表示你没看准，以对方念的为准再确认一遍。）"
+        )
+    note = str(reading.get("note") or "").strip()
+    return (
+        "（核验提示·证件识读，仅你自己看、绝不要读出来：对方出示了"
+        f"【{doc_type}】，但关键字段你没看清{('——' + note) if note else ''}。"
+        "自然地请他把证件举稳、对准镜头、避开反光再展示几秒，同时请他口头念出上面的关键信息。）"
+    )
+
+
+async def _read_document_shared(bridge: Any, frame: str) -> str:
+    """跑一次专用证件 OCR：去重 + 尽调留痕 + 通知前端，返回要注入的核验提示（可为空）。
+
+    与 describe_frame 同样跑线程池，不碰音频转发协程；任何失败返回 ""，绝不抛错。
+    """
+    loop = asyncio.get_running_loop()
+    _t0 = time.monotonic()
+    reading = await loop.run_in_executor(_RELAY_EXECUTOR, read_document, frame)
+    _dbg(f"OCR read_document 耗时 {time.monotonic()-_t0:.1f}s reading={reading}")
+    if not reading:
+        return ""
+    fingerprint = _doc_fingerprint(reading)
+    if fingerprint == bridge.last_doc_fingerprint:
+        return ""  # 同一证件同一读数已注入过（举着没动又触发了一轮），跳过
+    bridge.last_doc_fingerprint = fingerprint
+    # 尽调留痕：识读结果进观察登记簿（kind 标记区分普通画面观察），挂断时随转写落库。
+    video_calls.note_observation(bridge.enterprise_id, {"kind": "document_ocr", **reading})
+    try:
+        await bridge.browser.send(json.dumps({
+            "type": "vision.document", "summary": _doc_summary(reading), "reading": reading,
+        }))
+    except Exception:
+        pass
+    return _doc_hint(reading)
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # 上游 1：豆包 openspeech 实时对话（二进制帧协议）
 # ══════════════════════════════════════════════════════════════════════════
 class _DoubaoBridge:
@@ -236,6 +342,10 @@ class _DoubaoBridge:
         self.last_vision_at = 0.0  # 上次注入画面的时刻（monotonic），用于"静态场景也定期刷新事实"
         self.vision_in_flight = False  # 看画面任务在途（单飞闸门，防并发重复跑 describe_frame）
         self.pending_vision = None  # 待注入的 auto 画面文字：只在空闲时发，避免吞窗口盖到她真实回答
+        # ── 二段式证件识读状态 ──
+        self.ocr_in_flight = False  # 一次证件识读在途（单飞闸门）
+        self.last_hires_req_at = 0.0  # 上次请求高清帧的时刻（monotonic，节流）
+        self.last_doc_fingerprint = ""  # 上次注入的证件读数指纹（同读数不重复注入）
         # 用户当前是否在"一段语音"中：一句话有几十个 interim ASR 帧，只在起点动作一次
         # （发 speech_started + 打断），整段不重复，避免把小微切碎。ASR_ENDED 时复位。
         self.user_turn_active = False
@@ -355,6 +465,10 @@ async def _inject_vision_doubao(bridge: _DoubaoBridge, frame: str) -> None:
     # 尽调留痕：观察登记进进程内登记簿（纯内存 append），挂断时随转写一起落库。
     video_calls.note_observation(bridge.enterprise_id, observation)
     await _notify_visual_risks(bridge, observation)  # 新画面疑点→前端警示块（整通去重）
+    # 二段式证件识读：低清观察只认得出"有证件"、读不清字——发现证件就让前端回传
+    # 高清帧专门读一次（节流+单飞在 _request_hires_frame 里，重复触发无害）。
+    if observation and (observation.get("visible_documents") or []):
+        await _request_hires_frame(bridge)
     base = _caption_with_scene(caption, observation)  # 含"有没有人/几个人/场景"硬事实
     hint = _verify_hint(observation)  # 反欺诈核验内部指引（绝不读出），有则折进静默注入
     content = base + ("\n" + hint if hint else "")
@@ -377,6 +491,20 @@ async def _vision_task_doubao(bridge: _DoubaoBridge, frame: str) -> None:
         pass
     finally:
         bridge.vision_in_flight = False
+
+
+async def _ocr_task_doubao(bridge: _DoubaoBridge, frame: str) -> None:
+    """后台跑一次证件识读：结果折成核验提示，走与画面/风控同一条静默注入通道。"""
+    try:
+        hint = await _read_document_shared(bridge, frame)
+        if hint:
+            bridge.pending_risk_hint = (
+                bridge.pending_risk_hint + "\n" + hint if bridge.pending_risk_hint else hint)
+            await _flush_pending_vision(bridge)  # 空闲就立刻注入，不空闲攒着等 TTS_ENDED
+    except Exception:
+        pass
+    finally:
+        bridge.ocr_in_flight = False
 
 
 def _maybe_schedule_contradiction_check(bridge: _DoubaoBridge, utterance: str) -> None:
@@ -531,6 +659,9 @@ async def _pump_doubao_upstream(bridge: _DoubaoBridge) -> None:
                 bridge.recent_turns.append(("用户", utterance))
                 del bridge.recent_turns[:-8]
                 _maybe_schedule_contradiction_check(bridge, utterance)
+                # 口头预告出示材料（"我给你看下执照"）：等他把证件举起来再截高清帧识读。
+                if _wants_to_show_document(utterance):
+                    asyncio.create_task(_request_hires_frame(bridge, delay_s=2.5))
 
         # 只在 TTS_ENDED（她真说完、用户也没在说）flush 画面。【不在 CHAT_ENDED】：那时 TTS
         # 还在播，suppress 会切掉尾音。【也不在 ASR_ENDED】：用户刚说完、真实回复 ~1s 后就到，
@@ -592,6 +723,13 @@ async def _pump_doubao_browser(bridge: _DoubaoBridge) -> None:
                 bridge.vision_in_flight = True
                 asyncio.create_task(
                     _vision_task_doubao(bridge, str(data.get("frame") or "")))
+        elif t == "vision.hires_frame":
+            # 二段式证件识读的高清帧（前端只在收到 vision.request_hires 后回传）。
+            # 与常规看画面各用各的单飞闸门：识读 ~5s 期间不挡每轮低清观察。
+            if not bridge.ocr_in_flight:
+                bridge.ocr_in_flight = True
+                asyncio.create_task(
+                    _ocr_task_doubao(bridge, str(data.get("frame") or "")))
         elif t == "response.cancel" and bridge.session_started:
             await bridge.upstream.send(
                 dbq.make_full_client_frame(dbq.EVENT_CLIENT_INTERRUPT, {}, bridge.session_id))
@@ -647,6 +785,10 @@ class _StepBridge:
         self.last_vision_desc = ""
         self.vision_in_flight = False  # 看画面任务在途（单飞闸门）
         self.alerted_anomalies: set[str] = set()  # 已弹过的画面疑点指纹（整通范围）
+        # ── 二段式证件识读状态（与 _DoubaoBridge 同名，共用 _request_hires_frame 等辅助）──
+        self.ocr_in_flight = False
+        self.last_hires_req_at = 0.0
+        self.last_doc_fingerprint = ""
 
 
 async def _inject_vision_step(bridge: _StepBridge, frame: str) -> None:
@@ -668,6 +810,9 @@ async def _inject_vision_step(bridge: _StepBridge, frame: str) -> None:
     # 尽调留痕：观察登记进进程内登记簿（去重前登记，每帧观察都留痕）。
     video_calls.note_observation(bridge.enterprise_id, observation)
     await _notify_visual_risks(bridge, observation)  # 新画面疑点→前端警示块（整通去重）
+    # 二段式证件识读：发现证件就让前端回传高清帧专门读一次（节流+单飞在辅助函数里）。
+    if observation and (observation.get("visible_documents") or []):
+        await _request_hires_frame(bridge)
     if caption == bridge.last_vision_desc:
         return
     bridge.last_vision_desc = caption
@@ -692,6 +837,22 @@ async def _vision_task_step(bridge: _StepBridge, frame: str) -> None:
         bridge.vision_in_flight = False
 
 
+async def _ocr_task_step(bridge: _StepBridge, frame: str) -> None:
+    """后台跑一次证件识读（StepFun）：核验提示以 user 消息静默注入（不触发 response.create）。"""
+    try:
+        hint = await _read_document_shared(bridge, frame)
+        if hint:
+            await bridge.upstream.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": hint}]},
+            }))
+    except Exception:
+        pass
+    finally:
+        bridge.ocr_in_flight = False
+
+
 async def _pump_step_upstream(bridge: _StepBridge) -> None:
     async for msg in bridge.upstream:
         await bridge.browser.send(msg)
@@ -713,6 +874,13 @@ async def _pump_step_browser(bridge: _StepBridge) -> None:
                 bridge.vision_in_flight = True
                 asyncio.create_task(
                     _vision_task_step(bridge, str(data.get("frame") or "")))
+            continue
+        if data.get("type") == "vision.hires_frame":
+            # 二段式证件识读的高清帧，单飞后台跑，不挡常规看画面。
+            if not bridge.ocr_in_flight:
+                bridge.ocr_in_flight = True
+                asyncio.create_task(
+                    _ocr_task_step(bridge, str(data.get("frame") or "")))
             continue
         await bridge.upstream.send(msg)
 

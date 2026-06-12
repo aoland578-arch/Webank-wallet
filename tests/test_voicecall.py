@@ -12,8 +12,14 @@ import json  # noqa: E402
 import struct  # noqa: E402
 
 import voicecall_doubao as dbq  # noqa: E402
-from voicecall import _extract_json, _parse_observation, _salvage_caption  # noqa: E402
-from voicecall_relay import _caption_with_scene, _verify_hint  # noqa: E402
+from voicecall import _extract_json, _parse_observation, _parse_doc_reading, _salvage_caption  # noqa: E402
+from voicecall_relay import (  # noqa: E402
+    _caption_with_scene,
+    _doc_fingerprint,
+    _doc_hint,
+    _verify_hint,
+    _wants_to_show_document,
+)
 
 
 class VoicecallVisionTestCase(unittest.TestCase):
@@ -78,6 +84,65 @@ class VoicecallVisionTestCase(unittest.TestCase):
     def test_caption_person_present_without_count(self) -> None:
         out = _caption_with_scene("有人入镜", {"person_present": True})
         self.assertIn("可见人物", out)
+
+
+class DocumentOcrTestCase(unittest.TestCase):
+    """二段式证件识读：OCR 输出解析 + relay 侧触发/注入辅助。"""
+
+    def test_parses_document_reading(self) -> None:
+        raw = (
+            '{"document_type":"营业执照","fields":{"企业名称":"测试餐饮有限公司",'
+            '"统一社会信用代码":"91440300MA5F?????X","成立日期":"2021年3月"},'
+            '"legible":true,"note":""}'
+        )
+        reading = _parse_doc_reading(raw)
+        self.assertIsNotNone(reading)
+        self.assertEqual(reading["document_type"], "营业执照")
+        self.assertEqual(reading["fields"]["企业名称"], "测试餐饮有限公司")
+        self.assertTrue(reading["legible"])
+
+    def test_no_document_returns_none(self) -> None:
+        self.assertIsNone(_parse_doc_reading('{"document_type":"没有证件","fields":{}}'))
+        self.assertIsNone(_parse_doc_reading("不是 JSON 的输出"))
+        self.assertIsNone(_parse_doc_reading(""))
+
+    def test_drops_empty_and_nested_fields(self) -> None:
+        raw = (
+            '{"document_type":"身份证","fields":{"姓名":"麦立俊","住址":"",'
+            '"嵌套":{"a":1}},"legible":true,"note":""}'
+        )
+        reading = _parse_doc_reading(raw)
+        self.assertEqual(reading["fields"], {"姓名": "麦立俊"})
+
+    def test_doc_hint_with_fields_asks_readback(self) -> None:
+        hint = _doc_hint({
+            "document_type": "营业执照",
+            "fields": {"企业名称": "测试餐饮有限公司"},
+            "legible": True, "note": "",
+        })
+        self.assertIn("核验提示·证件识读", hint)
+        self.assertIn("测试餐饮有限公司", hint)
+        self.assertIn("口头念出", hint)
+
+    def test_doc_hint_illegible_asks_steady(self) -> None:
+        hint = _doc_hint({"document_type": "身份证", "fields": {}, "legible": False, "note": "反光"})
+        self.assertIn("没看清", hint)
+        self.assertIn("反光", hint)
+
+    def test_fingerprint_dedupes_same_reading(self) -> None:
+        a = {"document_type": "身份证", "fields": {"姓名": "麦立俊", "出生": "1990年"}}
+        b = {"document_type": "身份证", "fields": {"出生": "1990年", "姓名": "麦立俊"}}
+        c = {"document_type": "身份证", "fields": {"姓名": "麦子"}}
+        self.assertEqual(_doc_fingerprint(a), _doc_fingerprint(b))  # 字段顺序无关
+        self.assertNotEqual(_doc_fingerprint(a), _doc_fingerprint(c))
+
+    def test_show_document_keyword_trigger(self) -> None:
+        self.assertTrue(_wants_to_show_document("我给你看一下我的营业执照"))
+        self.assertTrue(_wants_to_show_document("身份证拿出来给您瞧瞧"))
+        # 只聊到证件、没有出示动作 → 不触发
+        self.assertFalse(_wants_to_show_document("当年办执照跑了好几趟"))
+        self.assertFalse(_wants_to_show_document("你看我这店里生意多好"))
+        self.assertFalse(_wants_to_show_document(""))
 
 
 class DoubaoCodecTestCase(unittest.TestCase):

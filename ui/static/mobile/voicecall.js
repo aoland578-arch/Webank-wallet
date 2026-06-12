@@ -222,11 +222,19 @@
   }
 
   // 复用 chat.js 已开的摄像头流；没有就自己开一路（带麦克风）。
+  // 视频按 720p 要：常规观察仍缩到 640 发（省 token），但二段式证件识读要靠
+  // 原始流的分辨率看清证件小字，源头只有 480p 的话放大也无济于事。
   async function ensureStream() {
-    if (selfVideo && selfVideo.srcObject) return selfVideo.srcObject;
+    if (selfVideo && selfVideo.srcObject) {
+      try {
+        const track = selfVideo.srcObject.getVideoTracks()[0];
+        if (track) await track.applyConstraints({ width: { ideal: 1280 }, height: { ideal: 720 } });
+      } catch (e) {} // 设备/浏览器不支持就用原分辨率，不影响通话
+      return selfVideo.srcObject;
+    }
     if (!navigator.mediaDevices?.getUserMedia) return null;
     const stream = await navigator.mediaDevices.getUserMedia({
-      video: true,
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
     });
     call.stream = stream;
@@ -239,10 +247,11 @@
     return stream;
   }
 
-  // 从摄像头画面截一帧，缩到 640 宽的 jpeg dataURL；画面没准备好返回 ""。
-  function captureFrame() {
+  // 从摄像头画面截一帧 jpeg dataURL；画面没准备好返回 ""。
+  // 默认 640/0.6 给每轮常规观察（省 token、省上行）；relay 要做证件识读时
+  // （vision.request_hires）传 1280/0.85，保住证件上的小字。
+  function captureFrame(maxW = 640, quality = 0.6) {
     if (!selfVideo || !selfVideo.videoWidth) return "";
-    const maxW = 640;
     const scale = Math.min(1, maxW / selfVideo.videoWidth);
     const w = Math.round(selfVideo.videoWidth * scale);
     const h = Math.round(selfVideo.videoHeight * scale);
@@ -252,7 +261,7 @@
     const ctx = canvas.getContext("2d");
     ctx.drawImage(selfVideo, 0, 0, w, h);
     try {
-      return canvas.toDataURL("image/jpeg", 0.6);
+      return canvas.toDataURL("image/jpeg", quality);
     } catch (e) {
       return ""; // 跨域污染等
     }
@@ -315,9 +324,39 @@
     // 用户**持续够响**（真想插话）才放行，并本地立即停播实现打断。
     let aiSpeakingUntil = 0; // 预计小微播放到的时间戳（>now 表示她正在说）
     let bargeFrames = 0; // 用户连续够响的帧数
-    const BARGE_LEVEL = 0.18; // 判为"用户在说话"的能量阈值（0.14 时外放回声易误触发，掐碎她的回复）
-    const BARGE_MIN_FRAMES = 6; // 需连续这么多帧（帧≈43ms，约 260ms）才放行打断：真插话轻松超过，
-    // 回声/瞬态噪声很难连续这么久。代价是打断响应慢 ~170ms，听感上可忽略。
+    const BARGE_LEVEL = 0.14; // 判为"用户在说话"的能量阈值（调回灵敏档；0.18/6帧 太钝，轻声说话打不断）
+    const BARGE_MIN_FRAMES = 2; // 需连续这么多帧（帧=1024样本@16k=64ms，约 128ms）才放行打断，滤掉瞬态噪声
+    // 预滚缓冲：闸门确认期间上传的是静音，用户句头（音量爬坡 + 确认期）会丢失——
+    // ASR 只听到后半句（"我现在在火锅店"→"在火锅店"）。所以把闸门期的真实音频
+    // 留在这个环形缓冲里，闸门退出时（确认插话 / 自然到期）一次性补发，句头一个字不丢。
+    // 12 帧 ≈ 770ms：她说话时浏览器 AEC 会压低麦克风，用户音量爬坡更慢，缓冲要够长。
+    const PRE_ROLL_MAX = 12; // 环形缓冲容量（帧）
+    const PRE_ROLL_VOICE = BARGE_LEVEL * 0.5; // 补发时判"这帧像有人声"的宽松阈值
+    let preRoll = []; // 闸门期间的真实音频帧 {buf, level}
+
+    // 闸门期被压成静音的真实音频补发上去，句头不丢。两种触发：
+    // - 确认插话（all=true）：整段补发，已确认是用户在说，安全。
+    // - 闸门自然到期（all=false）：用户紧跟她话尾开口、还没凑够确认帧——最常见的接话
+    //   时机，不补发句头就永远丢了。但缓冲前段可能是她的回声尾巴，全发会让上游把她
+    //   自己的话转写成用户说话。所以只发**末尾连续"有声"段**：回声衰减与用户起声之间
+    //   有安静缝隙，从最后一个安静帧之后开始补发。
+    function flushPreRoll(all) {
+      if (!preRoll.length) return;
+      let start = 0;
+      if (!all) {
+        start = preRoll.length;
+        while (start > 0 && preRoll[start - 1].level >= PRE_ROLL_VOICE) start -= 1;
+      }
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        for (let i = start; i < preRoll.length; i++) {
+          ws.send(JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: pcm16BufferToBase64(preRoll[i].buf),
+          }));
+        }
+      }
+      preRoll = [];
+    }
 
     // 每轮自动看一眼：你一开口就截一帧静默发给中继，等你说完小微回应时已看到当前画面。
     function autoVision() {
@@ -454,6 +493,19 @@
           // 每轮自动看画面是静默的：只复位单飞闸门，让下一轮可以再看；不打扰字幕/状态。
           visionBusy = false;
           break;
+        case "vision.request_hires": {
+          // relay 发现画面里有证件：回传一帧高清图做二段式证件识读。
+          // 静默动作，不打扰通话；节流/单飞都在 relay 侧，前端有求必应即可。
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            const hires = captureFrame(1280, 0.85);
+            if (hires) ws.send(JSON.stringify({ type: "vision.hires_frame", frame: hires }));
+          }
+          break;
+        }
+        case "vision.document":
+          // 证件识读结果：展示给经办人核对留底（小微侧的核验提示 relay 已静默注入）。
+          if (ev.summary) showRiskAlert("证件识读", String(ev.summary));
+          break;
         case "risk.visual":
           // 画面疑点警示：relay 已按"整通+措辞抖动"去重，只推真正新出现的疑点。
           for (const a of ev.items || []) {
@@ -506,21 +558,27 @@
           let outBuf = e.data; // 默认转发真实麦克风音频
           if (Date.now() < aiSpeakingUntil) {
             // 小微正在说话：默认压成静音，避免她的声音被麦克风录回去误触发打断。
+            // 真实音频进预滚缓冲：闸门退出时补发，句头不丢。
             const level = pcm16Level(new Int16Array(e.data));
+            preRoll.push({ buf: e.data, level });
+            if (preRoll.length > PRE_ROLL_MAX) preRoll.shift();
             if (level >= BARGE_LEVEL) {
               bargeFrames += 1;
               if (bargeFrames >= BARGE_MIN_FRAMES) {
-                stopPlayback(); // 用户确实想插话 → 本地立即停播，本帧起转发真实音频
+                stopPlayback(); // 用户确实想插话 → 本地立即停播，转发真实音频
                 bargeFrames = 0;
-              } else {
-                outBuf = new ArrayBuffer(e.data.byteLength); // 还没够帧，先发静音
+                flushPreRoll(true); // 确认插话：闸门期被压成静音的句头整段补发（含本帧）
+                return; // 本帧已随缓冲补发，别再发一遍
               }
+              outBuf = new ArrayBuffer(e.data.byteLength); // 还没够帧，先发静音
             } else {
               bargeFrames = 0;
               outBuf = new ArrayBuffer(e.data.byteLength); // 不够响：发静音
             }
           } else {
             bargeFrames = 0;
+            // 闸门刚到期：用户可能已紧跟她话尾开口（没凑够确认帧），补发末尾有声段。
+            flushPreRoll(false);
           }
           ws.send(JSON.stringify({
             type: "input_audio_buffer.append",

@@ -371,19 +371,29 @@ def _resolve_vision_provider() -> tuple[str, str, str, dict[str, Any]] | None:
     return ARK_API_KEY, ARK_BASE_URL, ARK_VISION_MODEL, {"max_tokens": 800}
 
 
-def _vision_request(frame_data_uri: str) -> str:
-    """跑一次视觉请求，返回模型输出的原始文本；网络/HTTP/结构异常/缺凭证都返回 ""（绝不抛错）。"""
+def _vision_request(
+    frame_data_uri: str,
+    prompt: str = _VISION_STRUCTURED_PROMPT,
+    max_tokens: int | None = None,
+) -> str:
+    """跑一次视觉请求，返回模型输出的原始文本；网络/HTTP/结构异常/缺凭证都返回 ""（绝不抛错）。
+
+    默认跑常规结构化观察；二段式证件识读（read_document）传专用 OCR prompt 进来，
+    并放大 max_tokens（证件全字段比一帧观察长得多，800 不够装）。
+    """
     resolved = _resolve_vision_provider()
     if resolved is None:
         return ""
     api_key, base_url, model, extra = resolved
+    if max_tokens is not None:
+        extra = {**extra, "max_tokens": max(max_tokens, int(extra.get("max_tokens") or 0))}
     payload = {
         "model": model,
         "messages": [{
             "role": "user",
             "content": [
                 {"type": "image_url", "image_url": {"url": frame_data_uri}},
-                {"type": "text", "text": _VISION_STRUCTURED_PROMPT},
+                {"type": "text", "text": prompt},
             ],
         }],
         "temperature": 0.2,
@@ -431,6 +441,73 @@ def describe_frame(frame_data_uri: str) -> dict[str, Any]:
     else:
         caption = _salvage_caption(raw) or "画面有点糊，看不太清。"
     return {"caption": caption, "observation": observation}
+
+
+# ── 二段式证件识读（方案 B 第二段）────────────────────────────────────────────
+# 常规观察（describe_frame）一帧干两件事（场景+证件），640 宽低清帧上 document_text
+# 基本读不出字。所以发现证件后走专门一遍：前端按 relay 的 vision.request_hires 回传
+# 1280 宽高清帧，这里用只干"读字"一件事的 prompt + 放大的 max_tokens 跑 OCR。
+_DOCUMENT_OCR_PROMPT = (
+    "你是小微企业贷款视频通话里的证件识读器。客户把证件/执照/单据举到了镜头前，"
+    "你的【唯一任务】是把上面**确实能看清**的文字读出来，看不清的字段直接省略、绝不猜测补全。"
+    "严格只输出一个 JSON 对象（不要解释、不要多余文字）：\n"
+    '{"document_type":"身份证|营业执照|银行卡|银行流水|合同|发票|其他单据|没有证件|看不清",'
+    '"fields":{"字段名":"字段值"},'
+    '"legible":true/false,'
+    '"note":"哪些部分看不清/被遮挡/反光，没有就空字符串"}'
+    "\n字段名按证件类型用通用叫法：身份证→姓名/性别/民族/出生/住址/公民身份号码/有效期限；"
+    "营业执照→企业名称/统一社会信用代码/类型/法定代表人/注册资本/成立日期/经营范围/住所；"
+    "流水/发票/合同→户名/账号/金额/日期/抬头等。"
+    "\n要求：fields 只放真读到的；号码类逐字符抄写，认不准的字符用？占位；"
+    "legible 表示关键字段（姓名/企业名/证号类）是否基本可读。直接只输出这个 JSON。"
+)
+
+
+def read_document(frame_data_uri: str) -> dict[str, Any] | None:
+    """对一帧高清画面跑专用证件 OCR，返回结构化识读结果；读不出/异常返回 None（绝不抛错）。
+
+    返回形如 ``{"document_type": "营业执照", "fields": {...}, "legible": true, "note": ""}``。
+    与 describe_frame 同一套 provider/解析容错，低频动作（发现证件才触发），重试一次。
+    """
+    if not frame_data_uri or _resolve_vision_provider() is None:
+        return None
+    raw = _vision_request(frame_data_uri, prompt=_DOCUMENT_OCR_PROMPT, max_tokens=1600)
+    reading = _parse_doc_reading(raw)
+    if reading is None:
+        raw = _vision_request(frame_data_uri, prompt=_DOCUMENT_OCR_PROMPT, max_tokens=1600)
+        reading = _parse_doc_reading(raw)
+    return reading
+
+
+def _parse_doc_reading(raw: str) -> dict[str, Any] | None:
+    """解析证件识读输出并规整字段；解析不出/明确没证件返回 None。"""
+    payload = _extract_json(raw)
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    doc_type = str(data.get("document_type") or "").strip()
+    if not doc_type or doc_type == "没有证件":
+        return None
+    fields = data.get("fields")
+    if not isinstance(fields, dict):
+        fields = {}
+    # 只留真有内容的字符串字段，防模型塞空值/嵌套结构
+    fields = {
+        str(k).strip(): str(v).strip()
+        for k, v in fields.items()
+        if str(k).strip() and isinstance(v, (str, int, float)) and str(v).strip()
+    }
+    return {
+        "document_type": doc_type,
+        "fields": fields,
+        "legible": bool(data.get("legible")),
+        "note": str(data.get("note") or "").strip(),
+    }
 
 
 # ── 实时矛盾检测（口述 vs 已知档案，确定性旁路）──────────────────────────────

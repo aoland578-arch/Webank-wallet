@@ -16,26 +16,33 @@
   <section id="authScreen" class="auth-screen" hidden>
     <div class="auth-panel">
       <div class="auth-brand">
-        <div class="brand-mark auth-brand-mark"></div>
-        <div>
-          <div class="auth-title">WeWallet 小微</div>
-          <div class="auth-subtitle">手机号登录后进入企业专属画像</div>
+        <div class="auth-brand-copy">
+          <img class="auth-wordmark" src="/static/shared/assets/wewallet-wordmark-tight.png" alt="WeWallet" />
+          <div class="auth-product">企业经营与财务智能助手</div>
         </div>
+        <img class="auth-mascot" src="/static/shared/assets/generated/xiaowei-login.png" alt="小微向您挥手问候" />
       </div>
 
       <form id="loginForm" class="auth-form">
+        <div class="auth-heading">
+          <h1>欢迎回来</h1>
+          <p>登录后继续使用小微企业经营服务</p>
+        </div>
         <div class="auth-tabs" role="tablist" aria-label="登录方式">
-          <button id="passwordLoginTab" class="auth-tab is-active" type="button">密码登录</button>
-          <button id="smsLoginTab" class="auth-tab" type="button">验证码登录</button>
+          <button id="passwordLoginTab" class="auth-tab is-active" type="button" role="tab" aria-selected="true">密码登录</button>
+          <button id="smsLoginTab" class="auth-tab" type="button" role="tab" aria-selected="false">验证码登录</button>
         </div>
         <label>
           <span>手机号</span>
           <input id="loginPhone" inputmode="numeric" autocomplete="tel" placeholder="请输入 11 位手机号" />
         </label>
-        <label id="loginPasswordField">
-          <span>密码</span>
-          <input id="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" />
-        </label>
+        <div id="loginPasswordField" class="auth-field">
+          <label for="loginPassword">密码</label>
+          <span class="auth-password-control">
+            <input id="loginPassword" type="password" autocomplete="current-password" placeholder="请输入密码" />
+            <button id="toggleLoginPassword" class="auth-password-toggle" type="button" aria-label="显示密码">显示</button>
+          </span>
+        </div>
         <div id="loginSmsField" class="auth-code-row" hidden>
           <label>
             <span>短信验证码</span>
@@ -43,11 +50,18 @@
           </label>
           <button id="sendLoginCodeButton" class="secondary-button" type="button">获取验证码</button>
         </div>
-        <button class="primary-button" type="submit">登录</button>
-        <button id="openRegisterButton" class="auth-link-button" type="button">注册账号</button>
+        <button class="primary-button auth-submit" type="submit">登录并继续</button>
+        <div class="auth-register-prompt">
+          <span>还没有账号？</span>
+          <button id="openRegisterButton" class="auth-link-button" type="button">立即注册</button>
+        </div>
       </form>
 
       <form id="registerForm" class="auth-form" hidden>
+        <div class="auth-heading">
+          <h1>创建账号</h1>
+          <p>注册后创建你的企业经营档案</p>
+        </div>
         <label>
           <span>手机号</span>
           <input id="registerPhone" inputmode="numeric" autocomplete="tel" placeholder="请输入 11 位手机号" />
@@ -68,6 +82,10 @@
       </form>
 
       <form id="enterpriseForm" class="auth-form" hidden>
+        <div class="auth-heading">
+          <h1>创建企业档案</h1>
+          <p>这些信息可以稍后继续补充</p>
+        </div>
         <label>
           <span>企业名称（选填）</span>
           <input id="enterpriseName" placeholder="可先跳过，后续在资料里补充" />
@@ -80,6 +98,10 @@
       </form>
 
       <p id="authMessage" class="auth-message"></p>
+      <div class="auth-security-note" aria-label="安全说明">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+        <span>信息加密传输，仅用于企业经营服务</span>
+      </div>
     </div>
   </section>
 
