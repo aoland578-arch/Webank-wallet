@@ -31,6 +31,7 @@ const walletPendingCount = document.getElementById("walletPendingCount");
 const openProfileButton = document.getElementById("openProfileButton");
 const openWalletButton = document.getElementById("openWalletButton");
 const openLoanButton = document.getElementById("openLoanButton");
+const openRiskGraphButton = document.getElementById("openRiskGraphButton");
 const openVideoCallButton = document.getElementById("openVideoCallButton");
 const mobileMenuButton = document.getElementById("mobileMenuButton");
 const closeVideoCallButton = document.getElementById("closeVideoCallButton");
@@ -78,6 +79,7 @@ const loanBody = document.getElementById("loanBody");
 const loanMessage = document.getElementById("loanMessage");
 const sidebarToggleButton = document.getElementById("sidebarToggleButton");
 const authScreen = document.getElementById("authScreen");
+const riskGraphView = window.RiskGraphView ? new window.RiskGraphView() : null;
 const loginForm = document.getElementById("loginForm");
 const registerForm = document.getElementById("registerForm");
 const enterpriseForm = document.getElementById("enterpriseForm");
@@ -487,6 +489,8 @@ function renderMessageAttachments(container, attachments) {
       const img = document.createElement("img");
       img.src = url;
       img.alt = attachment.name || "图片附件";
+      // 缩略图是 1:1 中心裁切，点开灯箱才能看到完整原图
+      img.onclick = () => openImageLightbox(url, attachment.name);
       card.appendChild(img);
     } else if (kind === "audio") {
       card.classList.add("audio-card");
@@ -548,6 +552,44 @@ function renderMessageAttachments(container, attachments) {
   }
   if (grid.children.length) container.appendChild(grid);
 }
+
+// ---------- 图片灯箱：点消息缩略图看完整原图 ----------
+let imageLightbox = null;
+
+function ensureImageLightbox() {
+  if (imageLightbox) return imageLightbox;
+  imageLightbox = document.createElement("div");
+  imageLightbox.className = "image-lightbox";
+  imageLightbox.hidden = true;
+  const img = document.createElement("img");
+  img.alt = "";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "image-lightbox-close";
+  close.setAttribute("aria-label", "关闭大图");
+  close.textContent = "×";
+  imageLightbox.append(img, close);
+  imageLightbox.addEventListener("click", closeImageLightbox); // 点任意处（含 ×）关闭
+  document.body.appendChild(imageLightbox);
+  return imageLightbox;
+}
+
+function openImageLightbox(url, name) {
+  const el = ensureImageLightbox();
+  const img = el.querySelector("img");
+  img.src = url;
+  img.alt = name || "图片附件";
+  el.hidden = false;
+}
+
+function closeImageLightbox() {
+  if (!imageLightbox || imageLightbox.hidden) return;
+  imageLightbox.hidden = true;
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeImageLightbox();
+});
 
 function renderEmpty() {
   messageList.innerHTML = `
@@ -720,6 +762,10 @@ function renderAuthState() {
   const auth = state.auth || { authenticated: false };
   const authenticated = Boolean(auth.authenticated) && !auth.needs_enterprise;
   authScreen.hidden = authenticated;
+  // 记住本次结论，下次首屏在 /api/auth/me 回来前就能直接亮对的那一屏（防闪聊天页）；
+  // 真实登录态已就位，摘掉首屏防闪标记，交还 hidden 属性控制。
+  localStorage.setItem("wewallet.lastAuth", authenticated ? "1" : "0");
+  document.documentElement.classList.remove("boot-auth");
   if (!auth.authenticated) {
     loginForm.hidden = false;
     registerForm.hidden = true;
@@ -737,6 +783,8 @@ function renderAuthState() {
   openProfileButton.disabled = !authenticated;
   openWalletButton.disabled = !authenticated;
   openLoanButton.disabled = !authenticated;
+  if (openRiskGraphButton) openRiskGraphButton.disabled = !authenticated;
+  riskGraphView?.setAuthenticated(authenticated);
 }
 
 function renderWallet() {
@@ -1617,6 +1665,13 @@ document.querySelectorAll(".brand-mark").forEach((mark) => {
   mark.classList.add("has-image");
 });
 setSidebarCollapsed(localStorage.getItem("wewallet.sidebarCollapsed") === "1");
+riskGraphView?.bind();
+// 首屏防闪：登录态要等 /api/auth/me 回来才知道（慢网 1-3 秒），期间按上次会话的
+// 结论先展示——没登录过/已退出的设备直接亮登录页，而不是先闪一下聊天页。
+// 若缓存判断错了（如 cookie 刚好过期），renderAuthState 会在响应到达后纠正。
+if (localStorage.getItem("wewallet.lastAuth") !== "1") {
+  authScreen.hidden = false;
+}
 syncResponsiveCopy();
 syncComposerTextState();
 renderMessages();
@@ -1627,3 +1682,81 @@ bootstrapApp();
 document.addEventListener("voicecall:saved", () => {
   Core.loadMessages().catch(() => {});
 });
+
+// ── GNN 风险评分卡 ────────────────────────────────────────────────────────────
+(function () {
+  const card    = document.getElementById("gnnScoreCard");
+  const refresh = document.getElementById("gnnScoreRefresh");
+  const valEl   = document.getElementById("gnnScoreValue");
+  const tagEl   = document.getElementById("gnnScoreTag");
+  const subsEl  = document.getElementById("gnnScoreSubs");
+  const statusEl = document.getElementById("gnnScoreStatus");
+  if (!card) return;
+
+  const SUB_LABELS = ["身份一致性", "经营真实性", "申请逻辑", "配合度"];
+  const SUB_KEYS   = ["identity", "business", "loan_logic", "cooperation"];
+
+  function scoreColor(rec) {
+    if (rec === "reject")  return "#dc2626";
+    if (rec === "approve") return "#059669";
+    return "#d97706";
+  }
+
+  function renderScore(data) {
+    const score = data.score ?? 0;
+    const rec   = data.recommendation || "review";
+    const sub   = data.sub_scores || {};
+
+    valEl.textContent = score.toFixed(1);
+    valEl.className   = "gnn-score-value risk-" + rec;
+
+    const tagText = { reject: "建议拒绝", review: "人工复核", approve: "建议通过" };
+    tagEl.textContent = tagText[rec] || rec;
+    tagEl.className   = "gnn-score-tag " + rec;
+
+    subsEl.innerHTML = SUB_KEYS.map((key, i) => {
+      const v   = sub[key] ?? 0;
+      const pct = Math.min((v / 25) * 100, 100).toFixed(1);
+      const color = v < 8 ? "#dc2626" : v < 16 ? "#d97706" : "#059669";
+      return `<div class="gnn-sub-item">
+        <span class="gnn-sub-label">${SUB_LABELS[i]}</span>
+        <div class="gnn-sub-bar-wrap">
+          <div class="gnn-sub-bar" style="width:${pct}%;background:${color}"></div>
+        </div>
+        <span class="gnn-sub-val">${v.toFixed(1)} / 25</span>
+      </div>`;
+    }).join("");
+
+    statusEl.textContent = `平均误差 ±5.6 分 · 基于 14996 个案例训练`;
+    card.hidden = false;
+  }
+
+  async function fetchGnnScore() {
+    if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+    statusEl.textContent = "GNN 评分中，请稍候（约 5-10 秒）…";
+    card.hidden = false;
+    refresh.disabled = true;
+    try {
+      const resp = await fetch("/api/gnn-score");
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        statusEl.textContent = "评分失败：" + (data.error || "未知错误");
+        return;
+      }
+      renderScore(data);
+    } catch (e) {
+      statusEl.textContent = "网络错误：" + e.message;
+    } finally {
+      refresh.disabled = false;
+    }
+  }
+
+  refresh.addEventListener("click", fetchGnnScore);
+
+  // 打开画像时自动触发评分
+  Core.on("profile-markdown", () => {
+    if (card.hidden && state.auth?.authenticated && !state.auth?.needs_enterprise) {
+      fetchGnnScore();
+    }
+  });
+})();

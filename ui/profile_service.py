@@ -32,6 +32,11 @@ from gateway import gateway_for_enterprise, profile_update_lock
 from storage import DATA_LOCK, atomic_write_text, load_json_file, save_json_file
 from wallet import load_pending, load_wallet_transactions, wallet_summary
 
+try:
+    from monitor_recorder import PromptBlock
+except ImportError:
+    PromptBlock = None  # type: ignore[misc, assignment]
+
 
 KNOWLEDGE = KnowledgeBase(ROOT, KNOWLEDGE_RAW_DIR, KNOWLEDGE_DB_FILE)
 
@@ -627,40 +632,7 @@ def wallet_facts_block(enterprise_id: str) -> str:
     return "\n".join(lines)
 
 
-def build_gateway_chat_turn(
-    messages: list[dict[str, str]],
-    user_message: str,
-    enterprise: dict[str, Any] | None = None,
-    knowledge_hits: list[KnowledgeHit] | None = None,
-    image_hits: list[ImageKnowledgeHit] | None = None,
-    attachments: list[dict[str, Any]] | None = None,
-) -> str:
-    transcript = transcript_for_prompt(messages)
-    if knowledge_hits is None:
-        knowledge_hits = KNOWLEDGE.search(user_message, top_k=KNOWLEDGE_TOP_K)
-    knowledge_context = format_hits_for_prompt(knowledge_hits)
-    image_context = format_image_hits_for_prompt(image_hits or [])
-    audio_signals_block = _audio_signals_block(attachments or [])
-    enterprise_name = str((enterprise or {}).get("name") or "当前企业")
-    enterprise_id = str((enterprise or {}).get("id") or "")
-    wallet_pending_block = _wallet_pending_block(enterprise_id)
-    profile_digest = profile_digest_for_prompt(enterprise_id)
-    wallet_facts = wallet_facts_block(enterprise_id)
-    open_verifications = open_verifications_block(enterprise_id) or "（暂无视频通话沉淀的待核实项。）"
-
-    # 回归主航道：以"小微自己连续几轮没做贷款工作"为准（客户夹个关键词刷不掉）。
-    # 不判断客户是否告别——只在客户给到自然开口时把没闭合的疑点带回，纯寒暄/道别则不硬塞。
-    drift = conversation_drift_turns(messages)
-    if drift >= OFFTOPIC_STEER_TURNS:
-        steer_note = (
-            f"**本轮提示**：你已连续约 {drift} 轮只在共情/闲聊。"
-            "下方'待核验'里若还有没闭合的项，**等客户这轮给到自然开口时**再用一句话温和带回，"
-            "别生硬打断；若本轮客户只是纯寒暄/道别、没有开口，就温暖回应一句，不要硬塞业务。"
-        )
-    else:
-        steer_note = "（小微近几轮仍在推进贷款业务，无需特别引导。）"
-
-    return f"""你的名字叫"小微"，正在通过网页 UI 作为小微贷款客户经理服务当前企业。
+_CHAT_SYSTEM_RULES = """你的名字叫"小微"，正在通过网页 UI 作为小微贷款客户经理服务当前企业。
 
 请以"小微"的身份面向客户自然回复，被问到身份时介绍自己叫小微。要求：
 1. 先承接客户当前问题，再追问 1 到 3 个最关键的信息。
@@ -703,40 +675,79 @@ def build_gateway_chat_turn(
    - items 至少 1 项，最多 4 项；name 简短（≤12 字）。
    - JSON 必须能被解析；除该 fenced 块外不要再输出其它代码块。
    - 不要在正文里复述"请上传…"列表，卡片会替你说；正文里点到为止。
-11. **始终营业 / 待命，按本轮实际内容成比例回应（不要判断客户是否要走）**：每一轮都**以客户最新消息为准**，只针对这条消息里真实存在的内容作出反应——有问题就正面答清楚（风控问题按规则 3.1 核口径，不能用一个表情或一句"晚安"代替回答），有新信息就接住，有可推进的开口就顺势推进或索取材料。若这一轮没有任何可作答 / 可推进的实质内容（纯寒暄、絮叨、道别），就简短温暖地回应一句即可，**不要凭空制造话术、不要催促、也不要机械追加收尾话术**。告别不是永久状态：你不需要也不要去判断客户"是不是要走"，只看本轮有没有值得回应 / 推进的东西；客户随时回到实质问题就正常服务。
+11. **始终营业 / 待命，按本轮实际内容成比例回应（不要判断客户是否要走）**：每一轮都**以客户最新消息为准**，只针对这条消息里真实存在的内容作出反应——有问题就正面答清楚（风控问题按规则 3.1 核口径，不能用一个表情或一句"晚安"代替回答），有新信息就接住，有可推进的开口就顺势推进或索取材料。若这一轮没有任何可作答 / 可推进的实质内容（纯寒暄、絮叨、道别），就简短温暖地回应一句即可，**不要凭空制造话术、不要催促、也不要机械追加收尾话术**。告别不是永久状态：你不需要也不要去判断客户"是不是要走"，只看本轮有没有值得回应 / 推进的东西；客户随时回到实质问题就正常服务。"""
 
-本地知识库片段：
-{knowledge_context}
 
-客户历史图档命中（本企业过往上传的图片，每轮重新检索；为空时不要提及历史比对）：
-{image_context}
+def build_gateway_chat_turn_blocks(
+    messages: list[dict[str, str]],
+    user_message: str,
+    enterprise: dict[str, Any] | None = None,
+    knowledge_hits: list[KnowledgeHit] | None = None,
+    image_hits: list[ImageKnowledgeHit] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[Any]]:
+    """Build the chat prompt split into named blocks for monitor observability.
 
-客户语音情绪/语种信号（仅内部参考，不要把标签或"我听出您..."念给客户）：
-{audio_signals_block}
+    Returns (prompt_str, blocks) where prompt_str is identical to what
+    build_gateway_chat_turn previously returned and blocks is a list of
+    PromptBlock objects (or [] when monitor_recorder is not importable).
+    """
+    transcript = transcript_for_prompt(messages)
+    if knowledge_hits is None:
+        knowledge_hits = KNOWLEDGE.search(user_message, top_k=KNOWLEDGE_TOP_K)
+    knowledge_context = format_hits_for_prompt(knowledge_hits)
+    image_context = format_image_hits_for_prompt(image_hits or [])
+    audio_signals_block = _audio_signals_block(attachments or [])
+    enterprise_name = str((enterprise or {}).get("name") or "当前企业")
+    enterprise_id = str((enterprise or {}).get("id") or "")
+    wallet_pending_block = _wallet_pending_block(enterprise_id)
+    profile_digest = profile_digest_for_prompt(enterprise_id)
+    wallet_facts = wallet_facts_block(enterprise_id)
+    open_verifications = open_verifications_block(enterprise_id) or "（暂无视频通话沉淀的待核实项。）"
 
-当前登录企业：
-{enterprise_name}
+    drift = conversation_drift_turns(messages)
+    if drift >= OFFTOPIC_STEER_TURNS:
+        steer_note = (
+            f"**本轮提示**：你已连续约 {drift} 轮只在共情/闲聊。"
+            "下方'待核验'里若还有没闭合的项，**等客户这轮给到自然开口时**再用一句话温和带回，"
+            "别生硬打断；若本轮客户只是纯寒暄/道别、没有开口，就温暖回应一句，不要硬塞业务。"
+        )
+    else:
+        steer_note = "（小微近几轮仍在推进贷款业务，无需特别引导。）"
 
-风控画像（每 10 轮自动更新、可能滞后几轮；沉淀了此前累积的经营事实与待核验点，作为长期记忆——下方"已有网页对话"只剩最近几轮，更早的事实以这份画像为准）：
-{profile_digest}
+    block_defs = [
+        ("system_rules", _CHAT_SYSTEM_RULES),
+        ("knowledge_rag", f"本地知识库片段：\n{knowledge_context}"),
+        ("image_history", f"客户历史图档命中（本企业过往上传的图片，每轮重新检索；为空时不要提及历史比对）：\n{image_context}"),
+        ("audio_signals", "客户语音情绪/语种信号（仅内部参考，不要把标签或\"我听出您...\"念给客户）：\n" + audio_signals_block),
+        ("enterprise_info", f"当前登录企业：\n{enterprise_name}"),
+        ("profile_digest", "风控画像（每 10 轮自动更新、可能滞后几轮；沉淀了此前累积的经营事实与待核验点，作为长期记忆——下方\"已有网页对话\"只剩最近几轮，更早的事实以这份画像为准）：\n" + profile_digest),
+        ("wallet_facts", "经营流水事实（系统实时汇总，做规则 3.1 里\"额度/收支是否匹配\"验算时以这里的数字为准，不要只信口述）：\n" + wallet_facts),
+        ("open_verifications", "视频通话沉淀的待核实疑点（挂断后风控总结自动记录；按规则 3.2 跨轮咬住——客户给到自然开口时温和核对，闭合前别不了了之，但绝不对客户说\"欺诈/风控/系统记录\"等字眼）：\n" + open_verifications),
+        ("offtopic_steer", f"回归主航道（每轮重新判断）：\n{steer_note}"),
+        ("wallet_pending", "钱包提案状态（每轮重新计算，以此为准，不要相信对话历史里的\"我刚提议过\"）：\n" + wallet_pending_block),
+        ("transcript", f"已有网页对话：\n{transcript}"),
+        ("user_input", f"客户最新输入：\n{user_message}"),
+    ]
+    blocks: list[Any] = []
+    if PromptBlock is not None:
+        blocks = [PromptBlock(btype, content) for btype, content in block_defs]
+    prompt = "\n\n".join(content for _, content in block_defs)
+    return prompt, blocks
 
-经营流水事实（系统实时汇总，做规则 3.1 里"额度/收支是否匹配"验算时以这里的数字为准，不要只信口述）：
-{wallet_facts}
 
-视频通话沉淀的待核实疑点（挂断后风控总结自动记录；按规则 3.2 跨轮咬住——客户给到自然开口时温和核对，闭合前别不了了之，但绝不对客户说"欺诈/风控/系统记录"等字眼）：
-{open_verifications}
-
-回归主航道（每轮重新判断）：
-{steer_note}
-
-钱包提案状态（每轮重新计算，以此为准，不要相信对话历史里的"我刚提议过"）：
-{wallet_pending_block}
-
-已有网页对话：
-{transcript}
-
-客户最新输入：
-{user_message}"""
+def build_gateway_chat_turn(
+    messages: list[dict[str, str]],
+    user_message: str,
+    enterprise: dict[str, Any] | None = None,
+    knowledge_hits: list[KnowledgeHit] | None = None,
+    image_hits: list[ImageKnowledgeHit] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> str:
+    prompt, _blocks = build_gateway_chat_turn_blocks(
+        messages, user_message, enterprise, knowledge_hits, image_hits, attachments
+    )
+    return prompt
 
 
 def build_profile_prompt(messages: list[dict[str, str]], enterprise_id: str, enterprise: dict[str, Any]) -> str:

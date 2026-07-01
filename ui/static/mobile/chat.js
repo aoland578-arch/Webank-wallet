@@ -31,8 +31,12 @@ const walletPendingCount = document.getElementById("walletPendingCount");
 const openProfileButton = document.getElementById("openProfileButton");
 const openWalletButton = document.getElementById("openWalletButton");
 const openLoanButton = document.getElementById("openLoanButton");
+const openRiskGraphButton = document.getElementById("openRiskGraphButton");
+const profileButtonLabel = openProfileButton?.querySelector("span:last-child");
+if (profileButtonLabel) profileButtonLabel.textContent = "企业画像";
 const openVideoCallButton = document.getElementById("openVideoCallButton");
 const mobileMenuButton = document.getElementById("mobileMenuButton");
+const scrollBottomButton = document.getElementById("scrollBottomButton");
 const closeVideoCallButton = document.getElementById("closeVideoCallButton");
 const videoCallBackdrop = document.getElementById("videoCallBackdrop");
 const videoCallModal = document.getElementById("videoCallModal");
@@ -78,6 +82,7 @@ const loanBody = document.getElementById("loanBody");
 const loanMessage = document.getElementById("loanMessage");
 const sidebarToggleButton = document.getElementById("sidebarToggleButton");
 const authScreen = document.getElementById("authScreen");
+const riskGraphView = window.RiskGraphView ? new window.RiskGraphView() : null;
 const loginForm = document.getElementById("loginForm");
 const registerForm = document.getElementById("registerForm");
 const enterpriseForm = document.getElementById("enterpriseForm");
@@ -211,7 +216,7 @@ function renderUploadRequestCard(message) {
   later.textContent = "稍后再传";
   later.onclick = () => {
     message.uploadRequestDismissed = true;
-    renderMessages();
+    renderMessagesFull();
   };
   controls.append(pickImage, pickFile, later);
   card.appendChild(controls);
@@ -248,7 +253,7 @@ function renderSuggestions(message) {
 function triggerUploadFromCard(message, kind) {
   if (state.busy) return;
   message.uploadRequestDismissed = true;
-  renderMessages();
+  renderMessagesFull();
   if (kind === "image") {
     imageInput.click();
   } else {
@@ -489,6 +494,8 @@ function renderMessageAttachments(container, attachments) {
       const img = document.createElement("img");
       img.src = url;
       img.alt = attachment.name || "图片附件";
+      // 缩略图是 1:1 中心裁切，点开灯箱才能看到完整原图
+      img.onclick = () => openImageLightbox(url, attachment.name);
       card.appendChild(img);
     } else if (kind === "audio") {
       card.classList.add("audio-card");
@@ -555,12 +562,8 @@ function renderEmpty() {
   messageList.innerHTML = `
     <div class="empty-state">
       <div class="empty-mascot" aria-hidden="true">
-        <video class="mascot-video" autoplay muted loop playsinline preload="metadata" poster="/static/shared/assets/mascot-smile.png">
-          <source src="/static/shared/assets/character-loop.webm" type="video/webm" />
-          <img src="/static/shared/assets/mascot-smile.png" alt="" />
-        </video>
+        <img class="empty-scene-preview" src="/static/shared/assets/generated/xiaowei-empty-preview.png" alt="" />
       </div>
-      <h1>聊聊您的生意和资金需求</h1>
       <div class="prompt-chips" aria-label="快捷指令">
         <button class="prompt-chip" type="button">我想了解贷款额度</button>
         <button class="prompt-chip" type="button">最近需要资金周转</button>
@@ -572,64 +575,108 @@ function renderEmpty() {
   bindPromptChips();
 }
 
+function buildMessageNode(message) {
+  const node = messageTemplate.content.firstElementChild.cloneNode(true);
+  node.dataset.role = message.role;
+  const attachments = Array.isArray(message.attachments) ? message.attachments : [];
+  if (attachments.length) node.classList.add("has-media");
+  node.querySelector(".message-role").textContent = message.role === "user" ? "我" : "小微";
+  const split = splitReasoning(message.content);
+  const rawVisible = split.text || message.content;
+  const visibleContent = message.role === "assistant" ? stripUploadRequestFence(rawVisible) : rawVisible;
+  const bubble = node.querySelector(".bubble");
+  if (attachments.length) {
+    const text = document.createElement("div");
+    text.className = "bubble-text";
+    const cleanText = visibleAttachmentText(visibleContent, attachments);
+    if (cleanText) {
+      if (message.role === "assistant") {
+        renderMarkdownInto(text, cleanText);
+      } else {
+        text.innerHTML = escapeHtml(cleanText).replaceAll("\n", "<br>");
+      }
+    } else {
+      text.hidden = true;
+    }
+    bubble.appendChild(text);
+    renderMessageAttachments(bubble, attachments);
+  } else if (message.role === "assistant") {
+    renderMarkdownInto(bubble, visibleContent);
+  } else {
+    bubble.innerHTML = escapeHtml(sanitizeVisibleText(visibleContent)).replaceAll("\n", "<br>");
+  }
+  if (message.role === "assistant") {
+    node.querySelector(".avatar").style.backgroundImage = 'url("/static/shared/assets/xiaowei-avatar-pro.png")';
+    node.querySelector(".avatar").classList.add("has-image");
+    const uploadCard = renderUploadRequestCard(message);
+    if (uploadCard) bubble.appendChild(uploadCard);
+    const bubbleWrap = node.querySelector(".bubble-wrap");
+    appendProgress(bubbleWrap, message.progress, Boolean(message.streaming));
+    if (!message.streaming) {
+      const suggestions = renderSuggestions(message);
+      if (suggestions) bubbleWrap.appendChild(suggestions);
+    }
+    if (SHOW_INTERNAL_PANELS) {
+      const thinking = message.thinking || message.reasoning_summary || split.reasoning;
+      appendDiffPanels(bubbleWrap, message.inline_diffs, Boolean(message.streaming));
+      appendDetails(bubbleWrap, "risk-reasoning reasoning-details", "内部过程", thinking, Boolean(message.streaming));
+    }
+  } else {
+    node.querySelector(".avatar").textContent = "";
+  }
+  return node;
+}
+
+// 滚动锚定：用户停在底部附近才跟随新内容自动滚；翻历史时不打扰，改为亮"回到底部"按钮。
+const SCROLL_STICK_THRESHOLD = 80;
+let stickToBottom = true;
+
+function scrollMessagesToBottom() {
+  stickToBottom = true;
+  messageList.scrollTop = messageList.scrollHeight;
+  syncScrollBottomButton();
+}
+
+function syncScrollBottomButton() {
+  if (!scrollBottomButton) return;
+  scrollBottomButton.hidden = stickToBottom || !state.messages.length;
+}
+
+// 流式输出每个 chunk 都触发渲染：与 state.messages 对齐时只动尾部节点，
+// 不再整列表重建（中端手机长对话会明显掉帧）。结构性变化（清空/旧消息变更）走全量。
+let renderedMessageCount = 0;
+
+function renderMessagesFull() {
+  renderedMessageCount = 0;
+  renderMessages();
+}
+
 function renderMessages() {
   if (!state.messages.length) {
     renderEmpty();
+    renderedMessageCount = 0;
+    syncScrollBottomButton();
     return;
   }
-  messageList.innerHTML = "";
-  for (const message of state.messages) {
-    const node = messageTemplate.content.firstElementChild.cloneNode(true);
-    node.dataset.role = message.role;
-    const attachments = Array.isArray(message.attachments) ? message.attachments : [];
-    if (attachments.length) node.classList.add("has-media");
-    node.querySelector(".message-role").textContent = message.role === "user" ? "我" : "小微";
-    const split = splitReasoning(message.content);
-    const rawVisible = split.text || message.content;
-    const visibleContent = message.role === "assistant" ? stripUploadRequestFence(rawVisible) : rawVisible;
-    const bubble = node.querySelector(".bubble");
-    if (attachments.length) {
-      const text = document.createElement("div");
-      text.className = "bubble-text";
-      const cleanText = visibleAttachmentText(visibleContent, attachments);
-      if (cleanText) {
-        if (message.role === "assistant") {
-          renderMarkdownInto(text, cleanText);
-        } else {
-          text.innerHTML = escapeHtml(cleanText).replaceAll("\n", "<br>");
-        }
-      } else {
-        text.hidden = true;
-      }
-      bubble.appendChild(text);
-      renderMessageAttachments(bubble, attachments);
-    } else if (message.role === "assistant") {
-      renderMarkdownInto(bubble, visibleContent);
-    } else {
-      bubble.innerHTML = escapeHtml(sanitizeVisibleText(visibleContent)).replaceAll("\n", "<br>");
+  const count = state.messages.length;
+  const inSync = renderedMessageCount > 0
+    && messageList.children.length === renderedMessageCount
+    && count >= renderedMessageCount;
+  if (inSync && count === renderedMessageCount) {
+    messageList.lastElementChild.replaceWith(buildMessageNode(state.messages[count - 1]));
+  } else if (inSync && count - renderedMessageCount <= 2) {
+    for (let i = renderedMessageCount; i < count; i += 1) {
+      messageList.appendChild(buildMessageNode(state.messages[i]));
     }
-    if (message.role === "assistant") {
-      node.querySelector(".avatar").style.backgroundImage = 'url("/static/shared/assets/xiaowei-avatar-pro.png")';
-      node.querySelector(".avatar").classList.add("has-image");
-      const uploadCard = renderUploadRequestCard(message);
-      if (uploadCard) bubble.appendChild(uploadCard);
-      const bubbleWrap = node.querySelector(".bubble-wrap");
-      appendProgress(bubbleWrap, message.progress, Boolean(message.streaming));
-      if (!message.streaming) {
-        const suggestions = renderSuggestions(message);
-        if (suggestions) bubbleWrap.appendChild(suggestions);
-      }
-      if (SHOW_INTERNAL_PANELS) {
-        const thinking = message.thinking || message.reasoning_summary || split.reasoning;
-        appendDiffPanels(bubbleWrap, message.inline_diffs, Boolean(message.streaming));
-        appendDetails(bubbleWrap, "risk-reasoning reasoning-details", "内部过程", thinking, Boolean(message.streaming));
-      }
-    } else {
-      node.querySelector(".avatar").textContent = "";
+  } else {
+    messageList.innerHTML = "";
+    for (const message of state.messages) {
+      messageList.appendChild(buildMessageNode(message));
     }
-    messageList.appendChild(node);
   }
-  messageList.scrollTop = messageList.scrollHeight;
+  renderedMessageCount = count;
+  if (stickToBottom) messageList.scrollTop = messageList.scrollHeight;
+  syncScrollBottomButton();
 }
 
 function applyBusy() {
@@ -644,6 +691,9 @@ function applyBusy() {
 function sendMessage(content) {
   const pending = Core.sendMessage(content);
   if (!pending) return;
+  stickToBottom = true; // 自己发的消息必须看到，即使之前翻到了历史
+  messageList.scrollTop = messageList.scrollHeight;
+  syncScrollBottomButton();
   messageInput.value = "";
   messageInput.style.height = "";
   syncComposerTextState();
@@ -733,6 +783,10 @@ function renderAuthState() {
   const auth = state.auth || { authenticated: false };
   const authenticated = Boolean(auth.authenticated) && !auth.needs_enterprise;
   authScreen.hidden = authenticated;
+  // 记住本次结论，下次首屏在 /api/auth/me 回来前就能直接亮对的那一屏（防闪聊天页）；
+  // 真实登录态已就位，摘掉首屏防闪标记，交还 hidden 属性控制。
+  localStorage.setItem("wewallet.lastAuth", authenticated ? "1" : "0");
+  document.documentElement.classList.remove("boot-auth");
   if (!auth.authenticated) {
     loginForm.hidden = false;
     registerForm.hidden = true;
@@ -750,6 +804,8 @@ function renderAuthState() {
   openProfileButton.disabled = !authenticated;
   openWalletButton.disabled = !authenticated;
   openLoanButton.disabled = !authenticated;
+  if (openRiskGraphButton) openRiskGraphButton.disabled = !authenticated;
+  riskGraphView?.setAuthenticated(authenticated);
 }
 
 function renderWallet() {
@@ -810,8 +866,84 @@ function renderWallet() {
     : "规划建议会在录入更多流水后生成。";
 }
 
+// ---------- 返回键支持：全屏弹层入历史栈 ----------
+// 手机上画像/钱包/贷款/账号/视频通话都是全屏页，安卓用户按返回键的预期是"关掉这一层"，
+// 而不是离开整个应用（视频通话中误触返回 = 直接掉线退出）。
+// 打开时 pushState 占一格历史；按返回键 → popstate 关掉最上层；
+// 点 × / 遮罩关闭时则主动 history.back() 把那格历史消费掉，保持栈对齐。
+const modalHistoryStack = []; // [{ name, close }]，弹层互斥、实际最多一层，但按栈处理更稳
+let suppressNextPopstate = false;
+
+function pushModalHistory(name, close) {
+  if (modalHistoryStack.some((item) => item.name === name)) return;
+  modalHistoryStack.push({ name, close });
+  try {
+    history.pushState({ wewalletModal: name }, "");
+  } catch (e) {}
+}
+
+function popModalHistory(name) {
+  const index = modalHistoryStack.findIndex((item) => item.name === name);
+  if (index === -1) return;
+  modalHistoryStack.splice(index, 1);
+  if (history.state && history.state.wewalletModal === name) {
+    suppressNextPopstate = true; // 这次 back 是自己发的，popstate 里别再关一遍
+    history.back();
+  }
+}
+
+window.addEventListener("popstate", () => {
+  if (suppressNextPopstate) {
+    suppressNextPopstate = false;
+    return;
+  }
+  const top = modalHistoryStack.pop();
+  if (top) top.close();
+});
+
+// ---------- 图片灯箱：点消息缩略图看完整原图 ----------
+let imageLightbox = null;
+
+function ensureImageLightbox() {
+  if (imageLightbox) return imageLightbox;
+  imageLightbox = document.createElement("div");
+  imageLightbox.className = "image-lightbox";
+  imageLightbox.hidden = true;
+  const img = document.createElement("img");
+  img.alt = "";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "image-lightbox-close";
+  close.setAttribute("aria-label", "关闭大图");
+  close.textContent = "×";
+  imageLightbox.append(img, close);
+  imageLightbox.addEventListener("click", closeImageLightbox); // 点任意处（含 ×）关闭
+  document.body.appendChild(imageLightbox);
+  return imageLightbox;
+}
+
+function openImageLightbox(url, name) {
+  const el = ensureImageLightbox();
+  const img = el.querySelector("img");
+  img.src = url;
+  img.alt = name || "图片附件";
+  el.hidden = false;
+  pushModalHistory("lightbox", closeImageLightbox); // 返回键/侧滑也能关
+}
+
+function closeImageLightbox() {
+  if (!imageLightbox || imageLightbox.hidden) return;
+  popModalHistory("lightbox");
+  imageLightbox.hidden = true;
+}
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeImageLightbox();
+});
+
 async function openWallet() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+  pushModalHistory("wallet", closeWallet);
   walletBackdrop.hidden = false;
   walletDrawer.hidden = false;
   walletDrawer.setAttribute("aria-hidden", "false");
@@ -825,6 +957,7 @@ async function openWallet() {
 }
 
 function closeWallet() {
+  popModalHistory("wallet");
   walletBackdrop.hidden = true;
   walletDrawer.hidden = true;
   walletDrawer.setAttribute("aria-hidden", "true");
@@ -834,7 +967,7 @@ function renderLoanLoading() {
   loanBody.innerHTML = `
     <div class="loan-loading">
       <span class="loan-spinner" aria-hidden="true"></span>
-      <span>正在根据您的风控画像和经营流水预估额度...</span>
+      <span>正在根据您的企业画像和经营流水预估额度...</span>
     </div>`;
 }
 
@@ -850,7 +983,7 @@ function renderLoanEstimate(estimate) {
     loanBody.innerHTML = `
       <div class="loan-empty">
         <div class="loan-empty-icon" aria-hidden="true">¥</div>
-        <p>还没有评估记录，点右上角「更新评估额度」即可根据当前风控画像和经营流水生成。</p>
+        <p>还没有评估记录，点右上角「更新评估额度」即可根据当前企业画像和经营流水生成。</p>
       </div>`;
     return;
   }
@@ -947,6 +1080,7 @@ async function recomputeLoanEstimate() {
 
 function openLoan() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+  pushModalHistory("loan", closeLoan);
   loanBackdrop.hidden = false;
   loanModal.hidden = false;
   loanModal.setAttribute("aria-hidden", "false");
@@ -954,6 +1088,7 @@ function openLoan() {
 }
 
 function closeLoan() {
+  popModalHistory("loan");
   loanBackdrop.hidden = true;
   loanModal.hidden = true;
   loanModal.setAttribute("aria-hidden", "true");
@@ -972,6 +1107,7 @@ function showVideoCallSelfPlaceholder(visible) {
 
 function openVideoCall() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+  pushModalHistory("videoCall", closeVideoCall);
   videoCallBackdrop.hidden = false;
   videoCallModal.hidden = false;
   videoCallModal.setAttribute("aria-hidden", "false");
@@ -989,6 +1125,7 @@ function stopVideoCallStream() {
 }
 
 function closeVideoCall() {
+  popModalHistory("videoCall");
   videoCallBackdrop.hidden = true;
   videoCallModal.hidden = true;
   videoCallModal.setAttribute("aria-hidden", "true");
@@ -1062,6 +1199,7 @@ function collectAccountProfilePayload() {
 
 async function openAccountModal() {
   if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+  pushModalHistory("account", closeAccountModal);
   accountBackdrop.hidden = false;
   accountModal.hidden = false;
   accountModal.setAttribute("aria-hidden", "false");
@@ -1075,6 +1213,7 @@ async function openAccountModal() {
 }
 
 function closeAccountModal() {
+  popModalHistory("account");
   accountBackdrop.hidden = true;
   accountModal.hidden = true;
   accountModal.setAttribute("aria-hidden", "true");
@@ -1160,6 +1299,7 @@ function renderProfileDiff(diff, changed, hidden = false) {
 }
 
 function openProfile(load = true) {
+  pushModalHistory("profile", closeProfile);
   profileBackdrop.hidden = false;
   profileDrawer.classList.add("open");
   profileDrawer.setAttribute("aria-hidden", "false");
@@ -1167,6 +1307,7 @@ function openProfile(load = true) {
 }
 
 function closeProfile() {
+  popModalHistory("profile");
   profileBackdrop.hidden = true;
   profileDrawer.classList.remove("open");
   profileDrawer.setAttribute("aria-hidden", "true");
@@ -1564,6 +1705,43 @@ window.addEventListener("resize", () => {
   if (!isMobileLayout()) setMobileSidebarOpen(false);
   syncResponsiveCopy();
 });
+
+// ---------- 滚动锚定：跟踪用户是否停在底部 ----------
+messageList.addEventListener("scroll", () => {
+  stickToBottom = messageList.scrollHeight - messageList.scrollTop - messageList.clientHeight < SCROLL_STICK_THRESHOLD;
+  syncScrollBottomButton();
+}, { passive: true });
+if (scrollBottomButton) scrollBottomButton.onclick = scrollMessagesToBottom;
+
+// ---------- 软键盘适配 ----------
+// iOS Safari 的 dvh 不随软键盘收缩，键盘会直接盖住 composer。
+// 用 visualViewport 算出被键盘（含页面被顶起的部分）遮住的高度，写进 --keyboard-inset，
+// CSS 里 .chat-stage 用它做 padding-bottom 把输入框顶上来。
+if (window.visualViewport) {
+  const vv = window.visualViewport;
+  let keyboardRaf = 0;
+  const applyKeyboardInset = () => {
+    keyboardRaf = 0;
+    // 捏合缩放时 vv.height 也会变小，那不是键盘，别误顶
+    const inset = isMobileLayout() && vv.scale === 1
+      ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop)
+      : 0;
+    document.documentElement.style.setProperty("--keyboard-inset", `${Math.round(inset)}px`);
+    if (inset > 0 && stickToBottom) messageList.scrollTop = messageList.scrollHeight;
+  };
+  const scheduleKeyboardInset = () => {
+    if (!keyboardRaf) keyboardRaf = requestAnimationFrame(applyKeyboardInset);
+  };
+  vv.addEventListener("resize", scheduleKeyboardInset);
+  vv.addEventListener("scroll", scheduleKeyboardInset);
+}
+messageInput.addEventListener("focus", () => {
+  // 键盘弹出动画结束后把对话滚回底部（仅在本来就贴底时）
+  if (!isMobileLayout()) return;
+  setTimeout(() => {
+    if (stickToBottom) messageList.scrollTop = messageList.scrollHeight;
+  }, 320);
+});
 accountButton.onclick = () => {
   if (isMobileLayout()) setMobileSidebarOpen(false);
   openAccountModal();
@@ -1626,7 +1804,10 @@ Core.on("account-profile", () => {
 });
 Core.on("wallet", renderWallet);
 Core.on("wallet-pending", renderWalletPending);
-Core.on("profile-markdown", (text) => renderMarkdownInto(profileMarkdown, text));
+Core.on("profile-markdown", (text) => {
+  const displayText = String(text || "").replace(/^# 企业风控画像/m, "# 企业画像");
+  renderMarkdownInto(profileMarkdown, displayText);
+});
 Core.on("profile-status", (text) => {
   if (profileSummary) profileSummary.textContent = text;
 });
@@ -1640,6 +1821,13 @@ document.querySelectorAll(".brand-mark").forEach((mark) => {
   mark.classList.add("has-image");
 });
 setSidebarCollapsed(localStorage.getItem("wewallet.sidebarCollapsed") === "1");
+riskGraphView?.bind();
+// 首屏防闪：登录态要等 /api/auth/me 回来才知道（慢网 1-3 秒），期间按上次会话的
+// 结论先展示——没登录过/已退出的设备直接亮登录页，而不是先闪一下聊天页。
+// 若缓存判断错了（如 cookie 刚好过期），renderAuthState 会在响应到达后纠正。
+if (localStorage.getItem("wewallet.lastAuth") !== "1") {
+  authScreen.hidden = false;
+}
 syncResponsiveCopy();
 syncComposerTextState();
 renderMessages();
@@ -1650,3 +1838,74 @@ bootstrapApp();
 document.addEventListener("voicecall:saved", () => {
   Core.loadMessages().catch(() => {});
 });
+
+// ── GNN 风险评分卡 ────────────────────────────────────────────────────────────
+(function () {
+  const card     = document.getElementById("gnnScoreCard");
+  const refresh  = document.getElementById("gnnScoreRefresh");
+  const valEl    = document.getElementById("gnnScoreValue");
+  const tagEl    = document.getElementById("gnnScoreTag");
+  const subsEl   = document.getElementById("gnnScoreSubs");
+  const statusEl = document.getElementById("gnnScoreStatus");
+  if (!card) return;
+
+  const SUB_LABELS = ["身份一致性", "经营真实性", "申请逻辑", "配合度"];
+  const SUB_KEYS   = ["identity", "business", "loan_logic", "cooperation"];
+
+  function renderScore(data) {
+    const score = data.score ?? 0;
+    const rec   = data.recommendation || "review";
+    const sub   = data.sub_scores || {};
+
+    valEl.textContent = score.toFixed(1);
+    valEl.className   = "gnn-score-value risk-" + rec;
+
+    const tagText = { reject: "建议拒绝", review: "人工复核", approve: "建议通过" };
+    tagEl.textContent = tagText[rec] || rec;
+    tagEl.className   = "gnn-score-tag " + rec;
+
+    subsEl.innerHTML = SUB_KEYS.map((key, i) => {
+      const v   = sub[key] ?? 0;
+      const pct = Math.min((v / 25) * 100, 100).toFixed(1);
+      const color = v < 8 ? "#dc2626" : v < 16 ? "#d97706" : "#059669";
+      return `<div class="gnn-sub-item">
+        <span class="gnn-sub-label">${SUB_LABELS[i]}</span>
+        <div class="gnn-sub-bar-wrap">
+          <div class="gnn-sub-bar" style="width:${pct}%;background:${color}"></div>
+        </div>
+        <span class="gnn-sub-val">${v.toFixed(1)} / 25</span>
+      </div>`;
+    }).join("");
+
+    statusEl.textContent = "平均误差 ±5.6 分 · 基于 14996 个案例训练";
+    card.hidden = false;
+  }
+
+  async function fetchGnnScore() {
+    if (!state.auth?.authenticated || state.auth?.needs_enterprise) return;
+    statusEl.textContent = "GNN 评分中，请稍候（约 5-10 秒）…";
+    card.hidden = false;
+    refresh.disabled = true;
+    try {
+      const resp = await fetch("/api/gnn-score");
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        statusEl.textContent = "评分失败：" + (data.error || "未知错误");
+        return;
+      }
+      renderScore(data);
+    } catch (e) {
+      statusEl.textContent = "网络错误：" + e.message;
+    } finally {
+      refresh.disabled = false;
+    }
+  }
+
+  refresh.addEventListener("click", fetchGnnScore);
+
+  Core.on("profile-markdown", () => {
+    if (card.hidden && state.auth?.authenticated && !state.auth?.needs_enterprise) {
+      fetchGnnScore();
+    }
+  });
+})();

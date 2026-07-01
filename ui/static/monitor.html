@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>微微银行钱包 · LLM 管理台</title>
+  <link rel="stylesheet" href="/static/monitor.css?v=20260616b" />
+</head>
+<body>
+  <div id="loginScreen" class="login-screen hidden">
+    <form id="loginForm" class="login-card">
+      <h1>LLM 管理台</h1>
+      <p class="login-note">观察提示词组装与大模型输入输出</p>
+      <label>
+        用户名
+        <input id="loginUsername" type="text" value="admin" autocomplete="username" />
+      </label>
+      <label>
+        密码
+        <input id="loginPassword" type="password" autocomplete="current-password" />
+      </label>
+      <button type="submit">登录</button>
+      <p id="loginError" class="login-error hidden"></p>
+    </form>
+  </div>
+
+  <div id="appShell" class="app-shell hidden">
+    <header class="top-bar">
+      <div class="top-left">
+        <label class="user-select-label">
+          用户
+          <select id="userSelect">
+            <option value="">选择用户…</option>
+          </select>
+        </label>
+        <span id="userMeta" class="user-meta"></span>
+      </div>
+      <div class="top-right">
+        <button id="refreshBtn" type="button" class="ghost-btn">刷新</button>
+        <button id="logoutBtn" type="button" class="ghost-btn">退出</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside id="recordList" class="record-list" aria-label="LLM 记录列表">
+        <div class="panel-head">
+          <h2>记录</h2>
+          <span id="recordCount" class="panel-count">0</span>
+        </div>
+        <div id="recordItems" class="record-items"></div>
+      </aside>
+
+      <main id="detailPanel" class="detail-panel" aria-label="LLM 详情">
+        <div id="detailEmpty" class="detail-empty">
+          <p>← 从左侧选择一条 LLM 记录</p>
+          <p class="muted">每条记录对应一次大模型输入或输出，输入侧会按来源分色展示完整提示词。</p>
+        </div>
+        <div id="detailContent" class="detail-content hidden"></div>
+      </main>
+    </div>
+  </div>
+
+  <script src="/static/monitor.js?v=20260616b"></script>
+</body>
+</html>

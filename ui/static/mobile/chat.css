@@ -690,6 +690,12 @@ body {
   height: 100dvh;
 }
 
+/* 首屏防闪：boot-auth 由 chat.html 头部内联脚本在首次绘制前打上（没登录过的设备），
+   让登录页先于 JS 显示；renderAuthState 拿到真实登录态后摘掉。 */
+html.boot-auth .auth-screen[hidden] {
+  display: grid;
+}
+
 .auth-screen {
   position: fixed;
   inset: 0;
@@ -1591,7 +1597,7 @@ button {
   overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto auto;
-  background: var(--surface);
+  background: #f7f9fb;
 }
 
 .topbar {
@@ -1604,6 +1610,7 @@ button {
 }
 
 .mobile-menu-button {
+  position: relative;
   display: none;
   width: 40px;
   height: 40px;
@@ -1616,10 +1623,25 @@ button {
 }
 
 .mobile-menu-button span {
-  width: 16px;
+  position: absolute;
+  left: 10px;
+  width: 18px;
   height: 2px;
   border-radius: 999px;
   background: currentColor;
+}
+
+.mobile-menu-button span:nth-child(1) {
+  top: 15px;
+}
+
+.mobile-menu-button span:nth-child(2) {
+  top: 22px;
+  width: 11px;
+}
+
+.mobile-menu-button span:nth-child(3) {
+  display: none;
 }
 
 .topbar-title {
@@ -1685,26 +1707,19 @@ button {
 
 .empty-mascot {
   position: relative;
-  width: min(320px, 56vw);
-  height: 250px;
+  width: min(720px, 76vw);
+  height: auto;
+  aspect-ratio: 1356 / 864;
   overflow: hidden;
-  margin-bottom: -6px;
+  margin-bottom: 20px;
   pointer-events: auto;
-  animation: mascot-breathe 4.8s ease-in-out infinite;
+  border-radius: 24px;
+  background: #edf3f5 url("/static/shared/assets/generated/xiaowei-empty-preview.png") center / cover no-repeat;
+  box-shadow: 0 18px 48px rgba(26, 68, 86, 0.14);
 }
 
 .empty-mascot::after {
-  content: "";
-  position: absolute;
-  left: 50%;
-  bottom: 18px;
-  width: 62%;
-  height: 14px;
-  border-radius: 999px;
-  background: rgba(22, 61, 76, 0.11);
-  filter: blur(8px);
-  transform: translateX(-50%);
-  animation: mascot-shadow 4.8s ease-in-out infinite;
+  content: none;
 }
 
 .empty-mascot img,
@@ -1720,6 +1735,22 @@ button {
   user-select: none;
 }
 
+.empty-mascot .empty-scene-preview {
+  position: static;
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  object-fit: cover;
+  transform: none;
+  filter: none;
+  animation: none;
+}
+
+.empty-mascot .mascot-video {
+  display: none;
+}
+
 .empty-mascot img {
   animation: mascot-nod 5.6s ease-in-out infinite;
 }
@@ -1731,15 +1762,51 @@ button {
   background: transparent;
 }
 
-.empty-state h1 {
+.empty-heading {
+  display: grid;
+  justify-items: center;
+  gap: 0;
+}
+
+.empty-heading-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #607681;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.12em;
+}
+
+.empty-heading-kicker span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #397ca4;
+  box-shadow: 0 0 0 4px rgba(57, 124, 164, 0.1);
+}
+
+.empty-heading h1 {
   position: relative;
   z-index: 0;
   max-width: 880px;
-  margin: -112px 0 0;
+  margin: 0;
   font-size: clamp(30px, 4vw, 46px);
-  font-weight: 400;
-  line-height: 1.22;
-  letter-spacing: 0;
+  font-weight: 500;
+  line-height: 1.18;
+  letter-spacing: -0.035em;
+  color: #324954;
+}
+
+.empty-heading h1 span,
+.empty-heading h1 strong {
+  display: inline;
+}
+
+.empty-heading h1 strong {
+  color: inherit;
+  font-weight: inherit;
 }
 
 .prompt-chips {
@@ -2134,6 +2201,7 @@ button {
   width: fit-content;
   max-width: min(520px, 100%);
   background: transparent;
+  box-shadow: none; /* 背景已透明，留着阴影会画出一圈"幽灵卡片"轮廓 */
   padding: 0;
   line-height: 1.35;
   white-space: normal;
@@ -2162,7 +2230,10 @@ button {
   justify-self: end;
   margin-left: 0;
   margin-right: 0;
-  width: min(260px, 100%);
+  /* 用 max-width 而不是 min(260px,100%)：百分比在气泡 fit-content 固有尺寸计算时
+     当 auto 处理，气泡会被图片原始宽度撑开；px 上限能真正参与固有尺寸收缩。 */
+  width: 100%;
+  max-width: 260px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   justify-items: end;
   gap: 6px;
@@ -2171,8 +2242,21 @@ button {
 }
 
 .message[data-role="user"].has-media .bubble-media-grid.media-count-1 {
-  width: min(260px, 100%);
+  width: 100%;
+  max-width: 260px;
   grid-template-columns: minmax(0, 1fr);
+}
+
+/* 单图时卡片随图片实际宽度收缩：小图（如 50px 的 logo）不再被拉伸成模糊大方块 */
+.message[data-role="user"].has-media .bubble-media-grid.media-count-1 .bubble-media-card {
+  width: fit-content;
+  max-width: 100%;
+  justify-self: end;
+}
+
+.message[data-role="user"].has-media .bubble-media-grid.media-count-1 .bubble-media-card img {
+  width: auto;
+  max-width: 100%;
 }
 
 .bubble-media-card {
@@ -2200,6 +2284,56 @@ button {
 .bubble-media-card video {
   display: block;
   width: 100%;
+}
+
+.bubble-media-card img {
+  /* 高度兜底：助手消息的图没有 1:1 裁切规则，超高图别垂直刷屏 */
+  max-height: 320px;
+  object-fit: cover;
+  cursor: zoom-in;
+}
+
+/* ---------- 图片灯箱：点缩略图看完整原图 ---------- */
+/* 缩略图被强制 1:1 裁切，长收据/流水截图只能看到中间一块，灯箱是看全图的唯一入口 */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 120; /* 盖过 auth(100) 和所有全屏弹层 */
+  display: grid;
+  place-items: center;
+  background: rgba(8, 14, 20, 0.88);
+  padding: calc(20px + env(safe-area-inset-top)) 16px calc(20px + env(safe-area-inset-bottom));
+  cursor: zoom-out;
+}
+
+/* hidden 属性要真正隐藏：作者 display 会盖过 UA 的 [hidden]，显式补一条 */
+.image-lightbox[hidden] {
+  display: none;
+}
+
+.image-lightbox img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 10px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.5);
+}
+
+.image-lightbox-close {
+  position: absolute;
+  top: calc(12px + env(safe-area-inset-top));
+  right: 12px;
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
 }
 
 .bubble-media-card.audio-card audio {
@@ -2309,6 +2443,7 @@ button {
   color: var(--brand-strong);
   text-decoration: none;
   overflow-wrap: anywhere;
+  line-height: 1.5; /* 媒体栅格为消图片缝隙设了 line-height:0，文件名换行会叠成乱码，这里必须恢复 */
 }
 
 .bubble-file-link:hover {
@@ -4052,6 +4187,65 @@ button {
 }
 .vc-risk-alert-detail { display: block; word-break: break-all; }
 
+/* ── 实时视觉识别日志（右侧，录屏常驻展示） ── */
+.vc-vision-log {
+  position: absolute;
+  top: 76px;
+  right: 14px;
+  z-index: 6;
+  width: min(220px, 44vw);
+  max-height: 240px;
+  border-radius: 12px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: rgba(8, 22, 38, 0.86);
+  border: 1px solid rgba(60, 180, 255, 0.35);
+  box-shadow: 0 6px 22px rgba(0, 40, 80, 0.45);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: vc-risk-in 0.28s ease-out;
+}
+.vc-vision-log-head {
+  flex: none;
+  padding: 6px 12px 5px;
+  font: 700 10px/1 "SF Mono", "Menlo", monospace;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: #4db8f0;
+  border-bottom: 1px solid rgba(60, 180, 255, 0.2);
+}
+.vc-vision-log-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 7px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.vc-vision-entry {
+  display: grid;
+  grid-template-columns: 16px 1fr auto;
+  gap: 4px;
+  align-items: start;
+  line-height: 1.45;
+}
+.vc-vision-entry-icon { font-size: 12px; margin-top: 1px; }
+.vc-vision-entry-text {
+  font: 11px/1.45 "SF Mono", "Menlo", "Courier New", monospace;
+  color: #b8e4fa;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+.vc-vision-entry.is-doc .vc-vision-entry-text { color: #7ee8ff; }
+.vc-vision-entry.is-pending .vc-vision-entry-text { color: #5aaccf; }
+.vc-vision-entry-time {
+  font: 10px/1 "SF Mono", "Menlo", monospace;
+  color: rgba(90, 160, 200, 0.6);
+  white-space: nowrap;
+  padding-top: 2px;
+}
+
 .video-call-dock {
   position: absolute;
   left: 0;
@@ -4411,10 +4605,7 @@ button {
   }
 
   .mobile-menu-button {
-    display: grid;
-    grid-template-rows: repeat(3, 2px);
-    align-content: center;
-    gap: 4px;
+    display: block;
     width: 38px;
     height: 38px;
     border-color: rgba(16, 24, 32, 0.08);
@@ -4441,21 +4632,32 @@ button {
   }
 
   .empty-mascot {
-    width: min(196px, 52vw);
-    height: 142px;
-    margin-bottom: 4px;
+    width: 100%;
+    height: auto;
+    margin-bottom: 16px;
+    border-radius: 18px;
   }
 
-  .empty-mascot img,
-  .mascot-video {
-    top: -22px;
-    width: 164px;
+  .empty-heading {
+    gap: 0;
   }
 
-  .empty-state h1 {
-    margin-top: -34px;
-    font-size: 28px;
-    line-height: 1.15;
+  .empty-heading-kicker {
+    font-size: 11px;
+    letter-spacing: 0.14em;
+  }
+
+  .empty-heading h1 {
+    margin-top: 0;
+    font-size: 25px;
+    line-height: 1.2;
+    letter-spacing: -0.055em;
+    white-space: nowrap;
+  }
+
+  .empty-heading h1 span,
+  .empty-heading h1 strong {
+    display: inline;
   }
 
   .prompt-chips {
@@ -4463,7 +4665,7 @@ button {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
-    transform: translateY(-6px);
+    transform: translateY(0);
   }
 
   .prompt-chip {
@@ -4550,11 +4752,11 @@ button {
   }
 
   .message[data-role="user"].has-media .bubble-media-grid {
-    width: min(220px, 100%);
+    max-width: 220px;
   }
 
   .message[data-role="user"].has-media .bubble-media-grid.media-count-1 {
-    width: min(220px, 100%);
+    max-width: 220px;
   }
 
   .composer,
@@ -4592,7 +4794,44 @@ button {
 
 /* Local customer-manager UI overrides. */
 .chat-stage {
+  position: relative; /* "回到底部"悬浮钮的定位上下文 */
   grid-template-rows: auto minmax(0, 1fr) auto;
+  /* 软键盘适配：chat.js 用 visualViewport 把键盘遮住的高度写进 --keyboard-inset，
+     这里垫起整个对话区，composer 跟着上来（iOS Safari 的 dvh 不随键盘收缩）。 */
+  padding-bottom: var(--keyboard-inset, 0px);
+}
+
+/* 回到底部：用户翻历史时流式输出不再拽底，由这个按钮一键回去 */
+.scroll-bottom-button {
+  position: absolute;
+  right: 16px;
+  bottom: calc(96px + env(safe-area-inset-bottom) + var(--keyboard-inset, 0px));
+  z-index: 8;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 1px solid rgba(22, 61, 76, 0.12);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--brand-strong);
+  box-shadow: 0 10px 26px rgba(26, 68, 86, 0.18);
+  cursor: pointer;
+  transition: transform 0.12s ease, box-shadow 0.12s ease;
+}
+
+.scroll-bottom-button:active {
+  transform: scale(0.94);
+}
+
+.scroll-bottom-button svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .composer .composer-attachments {
@@ -4611,6 +4850,17 @@ button {
 
 .composer #imageButton {
   grid-column: 1;
+  border: 1px solid #c9d9e4;
+  background: #edf3f7;
+  color: #617b8b;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
+}
+
+.composer #imageButton:hover,
+.composer #imageButton:focus-visible {
+  border-color: #b7cfe0;
+  background: #e3eef5;
+  color: #4c7187;
 }
 
 .composer #micButton {
@@ -5263,4 +5513,93 @@ button {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+/* ── GNN 风险评分卡 ──────────────────────────────────────────── */
+.gnn-score-card {
+  margin: 12px 16px;
+  border-radius: 10px;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border, #e5e7eb);
+  overflow: hidden;
+}
+.gnn-score-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--surface-alt, #f8f9fa);
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.gnn-score-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted, #6b7280);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.gnn-score-refresh {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  color: var(--muted, #6b7280);
+  padding: 0 4px;
+}
+.gnn-score-body { padding: 12px 14px 8px; }
+.gnn-score-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.gnn-score-value {
+  font-size: 36px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--ink, #111);
+}
+.gnn-score-unit { font-size: 14px; color: var(--muted, #6b7280); }
+.gnn-score-tag {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 20px;
+  margin-left: 4px;
+}
+.gnn-score-tag.reject  { background: #fee2e2; color: #dc2626; }
+.gnn-score-tag.review  { background: #fef3c7; color: #d97706; }
+.gnn-score-tag.approve { background: #d1fae5; color: #059669; }
+.gnn-score-value.risk-reject  { color: #dc2626; }
+.gnn-score-value.risk-review  { color: #d97706; }
+.gnn-score-value.risk-approve { color: #059669; }
+.gnn-score-subs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.gnn-sub-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.gnn-sub-label { font-size: 11px; color: var(--muted, #6b7280); }
+.gnn-sub-bar-wrap {
+  height: 5px;
+  background: var(--border, #e5e7eb);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.gnn-sub-bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+.gnn-sub-val { font-size: 11px; font-weight: 600; color: var(--ink, #111); }
+.gnn-score-status {
+  margin: 0;
+  padding: 4px 14px 10px;
+  font-size: 11px;
+  color: var(--muted, #6b7280);
 }

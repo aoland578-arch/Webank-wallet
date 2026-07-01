@@ -67,7 +67,6 @@ from profile_service import (
     KNOWLEDGE,
     KNOWLEDGE_TOP_K,
     build_call_memory_context,
-    build_gateway_chat_turn,
     extract_upload_request,
     knowledge_progress_events,
     load_profile_markdown,
@@ -110,7 +109,25 @@ from wallet import (
     wallet_lock,
     wallet_summary,
 )
+from risk_graph import build_risk_graph_payload
 import threading
+
+from monitor_auth import (
+    MONITOR_COOKIE_NAME,
+    MONITOR_SESSION_TTL_SECONDS,
+    create_monitor_session,
+    purge_expired_monitor_sessions,
+    revoke_monitor_token,
+    verify_monitor_credentials,
+    verify_monitor_token,
+)
+from monitor_hooks import (
+    on_session_reset,
+    record_chat_turn as _record_chat_turn,
+    record_voicecall_turn as _record_voicecall_turn,
+)
+from monitor_recorder import get_record, list_records, list_users as list_monitor_users
+from profile_service import build_gateway_chat_turn_blocks
 
 
 EmitFn = Callable[[str, dict[str, Any]], None]
@@ -263,6 +280,7 @@ def run_chat_turn(
     attachments: list[dict[str, Any]],
     *,
     emit: EmitFn | None = None,
+    user: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One chat turn: knowledge search → image KB → gateway → suggestions → persist.
 
@@ -370,9 +388,12 @@ def run_chat_turn(
                 gateway_delta_count += 1
             emit(event_type, payload)
 
+    chat_prompt, chat_blocks = build_gateway_chat_turn_blocks(
+        messages, display_message, enterprise, knowledge_hits, image_hits, attachments
+    )
     result = gateway_for_enterprise(enterprise_id).submit(
         f"chat:{enterprise_id}",
-        build_gateway_chat_turn(messages, display_message, enterprise, knowledge_hits, image_hits, attachments),
+        chat_prompt,
         image_paths=image_paths,
         event_callback=gateway_emit,
     )
@@ -403,6 +424,21 @@ def run_chat_turn(
     ]
     append_messages(enterprise_id, new_messages)
     messages.extend(new_messages)
+    try:
+        _record_chat_turn(
+            user=user or {},
+            enterprise=enterprise,
+            user_message=display_message,
+            prompt=chat_prompt,
+            prompt_blocks=chat_blocks,
+            result=result,
+            attachments=attachments,
+            knowledge_hits=knowledge_hits,
+            image_hits=image_hits,
+            tool_events=list(result.get("progress") or []),
+        )
+    except Exception:
+        pass
     if image_attachments:
         _schedule_image_ingest(enterprise_id, image_attachments)
     auto_profile = maybe_schedule_auto_profile_update(enterprise_id, enterprise, messages)
@@ -434,6 +470,11 @@ class Handler(BaseHTTPRequestHandler):
         "/api/knowledge/status": ("get_knowledge_status", "user"),
         "/api/image-knowledge/status": ("get_image_knowledge_status", "enterprise"),
         "/api/video-calls": ("get_video_calls", "enterprise"),
+        "/api/risk-graph": ("get_risk_graph", "enterprise"),
+        "/api/gnn-score": ("get_gnn_score", "enterprise"),
+        "/api/monitor/auth/me": ("get_monitor_auth_me", "public"),
+        "/api/monitor/users": ("get_monitor_users", "public"),
+        "/api/monitor/records": ("get_monitor_records", "public"),
     }
     POST_ROUTES: dict[str, tuple[str, str]] = {
         "/api/auth/sms/send": ("post_auth_sms_send", "public"),
@@ -455,6 +496,8 @@ class Handler(BaseHTTPRequestHandler):
         "/api/knowledge/reindex": ("post_knowledge_reindex", "user"),
         "/api/image-knowledge/reindex": ("post_image_knowledge_reindex", "enterprise"),
         "/api/reset": ("post_reset", "enterprise"),
+        "/api/monitor/auth/login": ("post_monitor_auth_login", "public"),
+        "/api/monitor/auth/logout": ("post_monitor_auth_logout", "public"),
         "/api/loan/estimate": ("post_loan_estimate", "enterprise"),
         "/api/profile/refresh": ("post_profile_refresh", "enterprise"),
     }
@@ -483,6 +526,37 @@ class Handler(BaseHTTPRequestHandler):
         if not enterprise:
             raise EnterpriseRequired("企业信息不存在，请重新绑定")
         return user, enterprise
+
+    # ── 监控台鉴权 helpers ────────────────────────────────────────────────
+    def monitor_authenticated(self) -> bool:
+        token = self.cookie_value(MONITOR_COOKIE_NAME)
+        return bool(token and verify_monitor_token(token))
+
+    def require_monitor_auth(self) -> None:
+        if not self.monitor_authenticated():
+            self.send_json({"error": "监控台未登录", "authenticated": False}, status=401)
+            raise AuthError("监控台未登录")
+
+    def monitor_query(self) -> dict[str, str]:
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params: dict[str, str] = {}
+        for part in qs.split("&"):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                params[k] = v
+        return params
+
+    def send_monitor_json_with_cookie(self, payload: dict[str, Any], token: str) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header(
+            "Set-Cookie",
+            f"{MONITOR_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={MONITOR_SESSION_TTL_SECONDS}",
+        )
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def auth_payload(self) -> dict[str, Any]:
         user = verify_auth_token(self.cookie_value(AUTH_COOKIE_NAME))
@@ -574,7 +648,14 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("", "/", "/chat"):
                 self.send_chat_page()
                 return
+            if path == "/monitor":
+                self.send_file(STATIC_DIR / "monitor.html", "text/html; charset=utf-8")
+                return
             if self._dispatch(self.GET_ROUTES, path):
+                return
+            if path.startswith("/api/monitor/records/"):
+                record_id = path[len("/api/monitor/records/"):]
+                self.get_monitor_record_detail(record_id)
                 return
             if path.startswith("/static/"):
                 self.get_static(path)
@@ -831,6 +912,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         memory_context = build_call_memory_context(enterprise_id, load_messages(enterprise_id))
         reply = call_xiaowei(transcript, history, frame, memory_context)
+        try:
+            _record_voicecall_turn(
+                user_id=str((user or {}).get("id") or ""),
+                enterprise_id=enterprise_id,
+                system_prompt="",
+                user_message=transcript,
+                assistant_reply=reply,
+                memory_context=memory_context,
+            )
+        except Exception:
+            pass
         self.send_json({"ok": True, "reply": reply})
 
     def post_voicecall_end(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
@@ -871,6 +963,15 @@ class Handler(BaseHTTPRequestHandler):
             )
             video_calls.schedule_risk_review(
                 call_id, enterprise_id, voice_messages, observations, contradictions)
+        try:
+            from monitor_hooks import record_voicecall_transcript as _record_voicecall_transcript
+            _record_voicecall_transcript(
+                user_id=str((user or {}).get("id") or ""),
+                enterprise_id=enterprise_id,
+                turns=normalized or [],
+            )
+        except Exception:
+            pass
         self.send_json({
             "ok": True,
             "saved": len(voice_messages),
@@ -884,7 +985,7 @@ class Handler(BaseHTTPRequestHandler):
         if not user_message and not attachments:
             self.send_json({"error": "message 不能为空"}, status=400)
             return
-        self.send_json(run_chat_turn(enterprise_id, enterprise, user_message, attachments))
+        self.send_json(run_chat_turn(enterprise_id, enterprise, user_message, attachments, user=user))
 
     def post_chat_stream(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
         enterprise_id = str(enterprise["id"])
@@ -909,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             emit("assistant.start", {"content": "正在分析客户需求..."})
-            result = run_chat_turn(enterprise_id, enterprise, user_message, attachments, emit=emit)
+            result = run_chat_turn(enterprise_id, enterprise, user_message, attachments, emit=emit, user=user)
             emit("message.complete", result)
         except (ValueError, GatewayPoolBusy) as exc:
             emit("error", {"error": str(exc)})
@@ -921,6 +1022,98 @@ class Handler(BaseHTTPRequestHandler):
         enterprise_id = str(enterprise["id"])
         clear_messages(enterprise_id)
         gateway_for_enterprise(enterprise_id).reset_session(f"chat:{enterprise_id}")
+        try:
+            on_session_reset(enterprise_id)
+        except Exception:
+            pass
+        self.send_json({"ok": True})
+
+    def get_gnn_score(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        import json as _json
+        import subprocess
+        from gnn_bridge import enterprise_to_case
+        enterprise_id = str(enterprise["id"])
+        try:
+            case = enterprise_to_case(enterprise_id)
+            result = subprocess.run(
+                [
+                    "/opt/anaconda3/envs/anti_fraud/bin/python3",
+                    str(Path(__file__).parent / "gnn_infer.py"),
+                ],
+                input=_json.dumps(case, ensure_ascii=False),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                self.send_json({"ok": False, "error": result.stderr[:300] or "推理子进程无输出"}, status=500)
+                return
+            payload = _json.loads(result.stdout.strip())
+            self.send_json(payload)
+        except subprocess.TimeoutExpired:
+            self.send_json({"ok": False, "error": "GNN 推理超时（>30s）"}, status=504)
+        except Exception as exc:
+            self.send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def get_risk_graph(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        params = parse_qs(self.path.partition("?")[2])
+        case_id = (params.get("case_id") or [""])[0].strip()
+        bucket = (params.get("bucket") or [""])[0].strip().lower()
+        if bucket not in {"", "high", "medium", "low"}:
+            self.send_json({"error": "bucket 只能是 high、medium 或 low"}, status=400)
+            return
+        try:
+            payload = build_risk_graph_payload(case_id=case_id, bucket=bucket)
+        except FileNotFoundError as exc:
+            self.send_json({"error": str(exc)}, status=404)
+            return
+        self.send_json(payload)
+
+    # ── 监控台 GET/POST handlers ──────────────────────────────────────────
+    def get_monitor_auth_me(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        authenticated = self.monitor_authenticated()
+        self.send_json({"authenticated": authenticated, "username": "admin" if authenticated else ""})
+
+    def get_monitor_users(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.require_monitor_auth()
+        self.send_json({"users": list_monitor_users()})
+
+    def get_monitor_records(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        self.require_monitor_auth()
+        params = self.monitor_query()
+        records = list_records(
+            user_id=params.get("user_id", ""),
+            enterprise_id=params.get("enterprise_id", ""),
+            limit=int(params.get("limit", "200")),
+            offset=int(params.get("offset", "0")),
+        )
+        self.send_json({"records": records})
+
+    def get_monitor_record_detail(self, record_id: str) -> None:
+        if not self.monitor_authenticated():
+            self.send_json({"error": "监控台未登录", "authenticated": False}, status=401)
+            return
+        record = get_record(record_id)
+        if record is None:
+            self.send_json({"error": "记录不存在"}, status=404)
+            return
+        self.send_json({"record": record})
+
+    def post_monitor_auth_login(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        payload = self.read_json()
+        username = str(payload.get("username") or "")
+        password = str(payload.get("password") or "")
+        if not verify_monitor_credentials(username, password):
+            self.send_json({"error": "用户名或密码错误"}, status=401)
+            return
+        token = create_monitor_session()
+        purge_expired_monitor_sessions()
+        self.send_monitor_json_with_cookie({"ok": True, "username": username}, token)
+
+    def post_monitor_auth_logout(self, user: dict[str, Any] | None, enterprise: dict[str, Any] | None) -> None:
+        token = self.cookie_value(MONITOR_COOKIE_NAME)
+        if token:
+            revoke_monitor_token(token)
         self.send_json({"ok": True})
 
     # ── POST handlers：账户 / 企业 ────────────────────────────────────────

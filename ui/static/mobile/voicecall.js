@@ -101,6 +101,48 @@
     }
   }
 
+  // ── 实时视觉识别日志（右侧常驻，录屏可见）────────────────────────────────
+  const visionLogEl = document.getElementById("videoCallVisionLog");
+  const VISION_LOG_MAX = 12;
+
+  function clearVisionLog() {
+    if (visionLogEl) { visionLogEl.innerHTML = ""; visionLogEl.hidden = true; }
+  }
+
+  function appendVisionLog(icon, text, cls) {
+    if (!visionLogEl) return;
+    if (!visionLogEl.querySelector(".vc-vision-log-body")) {
+      const head = document.createElement("div");
+      head.className = "vc-vision-log-head";
+      head.textContent = "视觉识别日志";
+      const body = document.createElement("div");
+      body.className = "vc-vision-log-body";
+      visionLogEl.appendChild(head);
+      visionLogEl.appendChild(body);
+    }
+    const body = visionLogEl.querySelector(".vc-vision-log-body");
+    while (body.childElementCount >= VISION_LOG_MAX) body.firstElementChild.remove();
+
+    const entry = document.createElement("div");
+    entry.className = "vc-vision-entry" + (cls ? " " + cls : "");
+    const iconEl = document.createElement("span");
+    iconEl.className = "vc-vision-entry-icon";
+    iconEl.textContent = icon;
+    const textEl = document.createElement("span");
+    textEl.className = "vc-vision-entry-text";
+    textEl.textContent = text;
+    const now = new Date();
+    const timeEl = document.createElement("span");
+    timeEl.className = "vc-vision-entry-time";
+    timeEl.textContent = now.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    entry.appendChild(iconEl);
+    entry.appendChild(textEl);
+    entry.appendChild(timeEl);
+    body.appendChild(entry);
+    visionLogEl.hidden = false;
+    body.scrollTop = body.scrollHeight;
+  }
+
   function showRiskAlert(title, detail) {
     if (!riskAlertsEl || !detail) return;
     const key = `${title}|${detail}`;
@@ -368,6 +410,7 @@
       lastAutoVision = now;
       visionBusy = true;
       ws.send(JSON.stringify({ type: "vision.frame", frame }));
+      appendVisionLog("📷", "截帧 → 分析画面中…", "is-pending");
     }
 
     function stopPlayback() {
@@ -498,14 +541,31 @@
           // 静默动作，不打扰通话；节流/单飞都在 relay 侧，前端有求必应即可。
           if (ws && ws.readyState === WebSocket.OPEN) {
             const hires = captureFrame(1280, 0.85);
-            if (hires) ws.send(JSON.stringify({ type: "vision.hires_frame", frame: hires }));
+            if (hires) {
+              ws.send(JSON.stringify({ type: "vision.hires_frame", frame: hires }));
+              appendVisionLog("🔍", "检测到证件，读取高清帧…", "is-pending");
+            }
           }
           break;
         }
-        case "vision.document":
+        case "vision.document": {
           // 证件识读结果：展示给经办人核对留底（小微侧的核验提示 relay 已静默注入）。
           if (ev.summary) showRiskAlert("证件识读", String(ev.summary));
+          // 视觉日志：展示完整字段，录屏可读。
+          const reading = ev.reading || {};
+          const docType = String(reading.document_type || "证件");
+          const fields = reading.fields || {};
+          const fieldKeys = Object.keys(fields);
+          let logText = docType;
+          if (fieldKeys.length) {
+            logText += "\n" + fieldKeys.map(k => `${k}: ${fields[k]}`).join("\n");
+          } else {
+            const note = String(reading.note || "").trim();
+            logText += "\n" + (note ? `（${note}）` : "关键字段未读清");
+          }
+          appendVisionLog("📄", logText, "is-doc");
           break;
+        }
         case "risk.visual":
           // 画面疑点警示：relay 已按"整通+措辞抖动"去重，只推真正新出现的疑点。
           for (const a of ev.items || []) {
@@ -772,6 +832,7 @@
     call.transcript = []; // 新通话，重置记录
     call.startedAt = Date.now();
     clearRiskAlerts(); // 上通的警示不带进新通话
+    clearVisionLog();  // 上通的视觉日志不带进新通话
     talkButton.textContent = "结束对话";
     if (muteButton) muteButton.disabled = false;
     showCaption("");

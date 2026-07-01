@@ -52,3 +52,15 @@ deploy/certs/*.key
 
 # 报告/宣传临时产物（生成脚本与渲染输出，不入库）
 tmp/
+Hermes存储全解.html
+提示词与存储全解.html
+系统架构总览.html
+风控GNN模型训练过程汇报.html
+风控GNN模型项目汇报.html
+
+# GNN 风控模型：只入库代码，训练数据/权重/输出体积过大且可重新生成
+gnn/data/
+gnn/model/*.pt
+gnn/output/
+gnn/data_gen/__pycache__/
+gnn/model/__pycache__/
